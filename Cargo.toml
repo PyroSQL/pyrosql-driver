@@ -1,0 +1,18 @@
+[workspace]
+members = ["rust", "protocol"]
+exclude = ["python", "ffi-quic", "ffi-pwire"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "BSL-1.1"
+
+[workspace.dependencies]
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

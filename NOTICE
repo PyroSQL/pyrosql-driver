@@ -1,0 +1,268 @@
+PyroSQL
+Copyright 2025-2026 Una Partida Mas SRL and PyroSQL Contributors
+
+This product includes software developed by third parties under
+the following licenses. All original copyrights are retained by
+their respective authors.
+
+================================================================================
+Core Runtime Dependencies
+================================================================================
+
+== tokio ==
+Copyright 2018-2026 Tokio Contributors
+Licensed under the MIT License
+https://github.com/tokio-rs/tokio
+
+== serde / serde_json ==
+Copyright 2014-2026 David Tolnay and serde Contributors
+Licensed under Apache License, Version 2.0 OR MIT
+https://github.com/serde-rs/serde
+
+== sonic-rs ==
+Copyright 2023-2026 CloudWeGo Authors
+Licensed under the Apache License, Version 2.0
+https://github.com/cloudwego/sonic-rs
+
+== bytes ==
+Copyright 2018-2026 Carl Lerche and bytes Contributors
+Licensed under the MIT License
+https://github.com/tokio-rs/bytes
+
+== anyhow ==
+Copyright 2019-2026 David Tolnay
+Licensed under MIT OR Apache-2.0
+https://github.com/dtolnay/anyhow
+
+== thiserror ==
+Copyright 2019-2026 David Tolnay
+Licensed under MIT OR Apache-2.0
+https://github.com/dtolnay/thiserror
+
+== tracing / tracing-subscriber ==
+Copyright 2019-2026 Tracing Contributors (Tokio project)
+Licensed under the MIT License
+https://github.com/tokio-rs/tracing
+
+== clap ==
+Copyright 2015-2026 Kevin K. and clap Contributors
+Licensed under MIT OR Apache-2.0
+https://github.com/clap-rs/clap
+
+== chrono ==
+Copyright 2014-2026 Kang Seonghoon and chrono Contributors
+Licensed under MIT OR Apache-2.0
+https://github.com/chronotope/chrono
+
+== uuid ==
+Copyright 2013-2026 uuid-rs Contributors
+Licensed under Apache-2.0 OR MIT
+https://github.com/uuid-rs/uuid
+
+== rand ==
+Copyright 2018-2026 The Rand Project Developers
+Licensed under MIT OR Apache-2.0
+https://github.com/rust-random/rand
+
+== futures ==
+Copyright 2016-2026 Alex Crichton and futures Contributors
+Licensed under MIT OR Apache-2.0
+https://github.com/rust-lang/futures-rs
+
+== async-trait ==
+Copyright 2019-2026 David Tolnay
+Licensed under MIT OR Apache-2.0
+https://github.com/dtolnay/async-trait
+
+== libc ==
+Copyright 2014-2026 The Rust Project Developers
+Licensed under MIT OR Apache-2.0
+https://github.com/rust-lang/libc
+
+== tempfile ==
+Copyright 2015-2026 Steven Allen and tempfile Contributors
+Licensed under MIT OR Apache-2.0
+https://github.com/Stebalien/tempfile
+
+================================================================================
+Storage & Memory
+================================================================================
+
+== mimalloc ==
+Copyright 2019-2026 Microsoft Corporation (Daan Leijen)
+Licensed under the MIT License
+https://github.com/purpleprotocol/mimalloc_rust
+
+== crossbeam (epoch, channel, skiplist) ==
+Copyright 2015-2026 The Crossbeam Project Developers
+Licensed under MIT OR Apache-2.0
+https://github.com/crossbeam-rs/crossbeam
+
+== dashmap ==
+Copyright 2019-2026 Acrimon and dashmap Contributors
+Licensed under the MIT License
+https://github.com/xacrimon/dashmap
+
+== parking_lot ==
+Copyright 2016-2026 Amanieu d'Antras
+Licensed under Apache License, Version 2.0 OR MIT
+https://github.com/Amanieu/parking_lot
+
+== lz4_flex ==
+Copyright 2020-2026 Pascal Seitz
+Licensed under the MIT License
+https://github.com/PSeitz/lz4_flex
+
+== zstd ==
+Copyright 2016-2026 Alexandre Bury
+Licensed under the MIT License
+https://github.com/gyscos/zstd-rs
+
+== crc32fast ==
+Copyright 2018-2026 Sam Rijs and Alex Crichton
+Licensed under MIT OR Apache-2.0
+https://github.com/srijs/rust-crc32fast
+
+== xxhash-rust ==
+Copyright 2020-2026 DoumanAsh
+Licensed under the Boost Software License 1.0
+https://github.com/DoumanAsh/xxhash-rust
+
+== bumpalo ==
+Copyright 2019-2026 Nick Fitzgerald
+Licensed under MIT OR Apache-2.0
+https://github.com/fitzgen/bumpalo
+
+== smallvec ==
+Copyright 2018-2026 The Servo Project Developers
+Licensed under MIT OR Apache-2.0
+https://github.com/servo/rust-smallvec
+
+== itoa ==
+Copyright 2016-2026 David Tolnay
+Licensed under MIT OR Apache-2.0
+https://github.com/dtolnay/itoa
+
+== rustc-hash ==
+Copyright 2015-2026 The Rust Project Developers
+Licensed under Apache-2.0 OR MIT
+https://github.com/rust-lang/rustc-hash
+
+================================================================================
+I/O & Networking
+================================================================================
+
+== io-uring ==
+Copyright 2019-2026 quininer and io-uring Contributors
+Licensed under MIT OR Apache-2.0
+https://github.com/tokio-rs/io-uring
+
+== quinn (QUIC implementation) ==
+Copyright 2018-2026 Quinn Contributors
+Licensed under Apache License, Version 2.0 OR MIT
+https://github.com/quinn-rs/quinn
+
+== rustls ==
+Copyright 2016-2026 rustls Contributors
+Licensed under Apache License, Version 2.0 OR ISC OR MIT
+https://github.com/rustls/rustls
+
+== rustls-pemfile ==
+Copyright 2020-2026 rustls Contributors
+Licensed under Apache-2.0 OR ISC OR MIT
+https://github.com/rustls/pemfile
+
+== nix ==
+Copyright 2014-2026 nix-rust Contributors
+Licensed under the MIT License
+https://github.com/nix-rust/nix
+
+== core_affinity ==
+Copyright 2017-2026 core_affinity Contributors
+Licensed under MIT/Apache-2.0
+https://github.com/Elzair/core_affinity_rs
+
+== tokio-postgres ==
+Copyright 2016-2026 Steven Fackler
+Licensed under MIT OR Apache-2.0
+https://github.com/sfackler/rust-postgres
+
+================================================================================
+Cryptography
+================================================================================
+
+== ring ==
+Copyright 2015-2026 Brian Smith and ring Contributors
+Licensed under ISC-style license
+https://github.com/briansmith/ring
+
+== subtle ==
+Copyright 2016-2026 Isis Lovecruft and Henry de Valence
+Licensed under BSD-3-Clause
+https://github.com/dalek-cryptography/subtle
+
+================================================================================
+SQL & Query Processing
+================================================================================
+
+== sqlparser ==
+Copyright 2018-2026 sqlparser-rs contributors
+Licensed under the Apache License, Version 2.0
+https://github.com/sqlparser-rs/sqlparser-rs
+
+== rust-stemmers ==
+Copyright 2018-2026 CurrySoftware
+Licensed under MIT/BSD-3-Clause
+https://github.com/CurrySoftware/rust-stemmers
+
+================================================================================
+Compilation & Execution
+================================================================================
+
+== cranelift (codegen, frontend, jit, module, native) ==
+Copyright 2019-2026 Bytecode Alliance
+Licensed under Apache License, Version 2.0 WITH LLVM-exception
+https://github.com/bytecodealliance/wasmtime/tree/main/cranelift
+
+== wasmtime ==
+Copyright 2019-2026 Bytecode Alliance
+Licensed under Apache License, Version 2.0 WITH LLVM-exception
+https://github.com/bytecodealliance/wasmtime
+
+================================================================================
+Serialization & Protocols
+================================================================================
+
+== prost (Protocol Buffers) ==
+Copyright 2017-2026 Dan Burkert and prost Contributors
+Licensed under the Apache License, Version 2.0
+https://github.com/tokio-rs/prost
+
+== tonic (gRPC) ==
+Copyright 2019-2026 Lucio Franco and tonic Contributors
+Licensed under the MIT License
+https://github.com/hyperium/tonic
+
+== Apache Arrow / Arrow Flight SQL ==
+Copyright 2016-2026 The Apache Software Foundation
+Licensed under the Apache License, Version 2.0
+https://github.com/apache/arrow-rs
+
+================================================================================
+CLI & TUI
+================================================================================
+
+== crossterm ==
+Copyright 2018-2026 Timon Post
+Licensed under the MIT License
+https://github.com/crossterm-rs/crossterm
+
+== ratatui ==
+Copyright 2023-2026 Ratatui Developers
+Licensed under the MIT License
+https://github.com/ratatui-org/ratatui
+
+================================================================================
+
+For the complete list of transitive dependencies and their licenses, run:
+    cargo tree --format "{p} {l}"

@@ -1,0 +1,29 @@
+[package]
+name = "pyrosql"
+version = "1.0.0"
+edition = "2021"
+description = "Official Rust driver for PyroSQL — PWire binary protocol"
+license = "MIT"
+repository = "https://github.com/pyrosql/pyrosql-driver"
+homepage = "https://pyrosql.com"
+keywords = ["database", "sql", "driver", "pyrosql"]
+categories = ["database"]
+
+[lib]
+name = "pyrosql"
+
+[dependencies]
+pyrosql-protocol = { path = "../protocol", version = "1.0.0" }
+quinn   = { workspace = true, features = ["rustls"] }
+rustls  = { workspace = true }
+rcgen   = "0.12"
+bytes   = { workspace = true }
+tokio   = { workspace = true, features = ["rt", "net", "io-util", "time", "sync"] }
+serde   = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+ring       = "0.17"
+base64     = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

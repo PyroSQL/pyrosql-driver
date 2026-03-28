@@ -1,0 +1,32 @@
+/* PyroSQL C-ABI header for PHP FFI / Ruby FFI / etc. */
+
+void pyro_pwire_init(void);
+void* pyro_pwire_connect(const char* url);
+char* pyro_pwire_query(void* handle, const char* sql);
+int64_t pyro_pwire_execute(void* handle, const char* sql);
+char* pyro_pwire_begin(void* handle);
+int32_t pyro_pwire_commit(void* handle, const char* tx_id);
+int32_t pyro_pwire_rollback(void* handle, const char* tx_id);
+int64_t pyro_pwire_bulk_insert(void* handle, const char* table, const char* json_rows);
+char* pyro_pwire_prepare(void* handle, const char* sql);
+char* pyro_pwire_execute_prepared(void* handle, const char* prepared_json, const char* params_json);
+void* pyro_pwire_pool_create(const char* url, uint32_t max_size);
+void* pyro_pwire_pool_get(void* pool);
+void pyro_pwire_pool_return(void* pool, void* client);
+void pyro_pwire_pool_destroy(void* pool);
+char* pyro_pwire_query_retry(void* handle, const char* sql);
+int64_t pyro_pwire_execute_retry(void* handle, const char* sql);
+char* pyro_pwire_watch(void* handle, const char* sql);
+int32_t pyro_pwire_unwatch(void* handle, const char* channel);
+int32_t pyro_pwire_listen(void* handle, const char* channel);
+int32_t pyro_pwire_unlisten(void* handle, const char* channel);
+int32_t pyro_pwire_notify(void* handle, const char* channel, const char* payload);
+void pyro_pwire_on_notification(void* handle, void (*callback)(char*));
+char* pyro_pwire_copy_out(void* handle, const char* sql);
+int64_t pyro_pwire_copy_in(void* handle, const char* table, const char* columns_json, const char* csv_data);
+char* pyro_pwire_subscribe_cdc(void* handle, const char* table);
+char* pyro_pwire_query_cursor(void* handle, const char* sql);
+char* pyro_pwire_cursor_next(const char* cursor, uint64_t index);
+void pyro_pwire_free_string(char* s);
+void pyro_pwire_close(void* handle);
+void pyro_pwire_shutdown(void);

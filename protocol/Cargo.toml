@@ -1,0 +1,16 @@
+[package]
+name = "pyrosql-protocol"
+version = "1.0.0"
+edition = "2021"
+description = "PWire protocol codec for PyroSQL — shared types for client and server"
+license-file = "../LICENSE"
+repository = "https://github.com/pyrosql/pyrosql-driver"
+homepage = "https://pyrosql.com"
+keywords = ["database", "protocol", "pyrosql", "pwire"]
+categories = ["database"]
+
+[dependencies]
+bytes = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+quinn = { workspace = true }

@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Rust crates.io ──
+  publish-rust:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish -p pyrosql-protocol --token ${{ secrets.CRATES_IO_TOKEN }}
+      - run: sleep 30
+      - run: cargo publish -p pyrosql --token ${{ secrets.CRATES_IO_TOKEN }}
+    continue-on-error: true
+
+  # ── FFI shared libraries ──
+  build-ffi:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: libpyrosql_ffi_pwire.so
+            label: linux-x86_64
+            ext: .so
+          - os: macos-14
+            target: aarch64-apple-darwin
+            lib: libpyrosql_ffi_pwire.dylib
+            label: macos-arm64
+            ext: .dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            lib: pyrosql_ffi_pwire.dll
+            label: windows-x86_64
+            ext: .dll
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi-${{ matrix.target }}
+      - run: cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
+      - name: Rename artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp ffi-pwire/target/${{ matrix.target }}/release/${{ matrix.lib }} \
+             dist/pyrosql-driver-${{ github.ref_name }}-${{ matrix.label }}${{ matrix.ext }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ── Python wheel ──
+  build-python:
+    name: Build Python wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install build
+      - run: cd python && python -m build --wheel --outdir dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python
+          path: python/dist/*.whl
+
+  # ── Publish Python to PyPI ──
+  publish-python:
+    name: Publish to PyPI
+    needs: build-python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+          packages-dir: dist/
+    continue-on-error: true
+
+  # ── GitHub Release ──
+  create-release:
+    name: GitHub Release
+    needs: [build-ffi, build-python]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          merge-multiple: true
+          path: assets/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          merge-multiple: true
+          path: assets/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          merge-multiple: true
+          path: assets/
+      - uses: actions/download-artifact@v4
+        with:
+          name: python
+          path: assets/
+        continue-on-error: true
+      - run: ls -la assets/
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: assets/*

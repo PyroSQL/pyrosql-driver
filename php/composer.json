@@ -1,0 +1,18 @@
+{
+    "name": "pyrosql/pyrosql",
+    "description": "PyroSQL — PHP client for PyroSQL via PWire (FFI bindings)",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=7.4",
+        "ext-ffi": "*",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "PyroSQL\\": "src/"
+        }
+    },
+    "keywords": ["pyrosql", "database", "sql", "pwire"],
+    "homepage": "https://pyrosql.com"
+}
