@@ -1,0 +1,12 @@
+/app/PyroSQL.Data/obj/Debug/net8.0/PyroSQL.Data.csproj.AssemblyReference.cache
+/app/PyroSQL.Data/obj/Debug/net8.0/PyroSQL.Data.GeneratedMSBuildEditorConfig.editorconfig
+/app/PyroSQL.Data/bin/Debug/net8.0/PyroSQL.Data.deps.json
+/app/PyroSQL.Data/bin/Debug/net8.0/PyroSQL.Data.dll
+/app/PyroSQL.Data/bin/Debug/net8.0/PyroSQL.Data.pdb
+/app/PyroSQL.Data/obj/Debug/net8.0/PyroSQL.Data.AssemblyInfoInputs.cache
+/app/PyroSQL.Data/obj/Debug/net8.0/PyroSQL.Data.AssemblyInfo.cs
+/app/PyroSQL.Data/obj/Debug/net8.0/PyroSQL.Data.csproj.CoreCompileInputs.cache
+/app/PyroSQL.Data/obj/Debug/net8.0/PyroSQL.Data.dll
+/app/PyroSQL.Data/obj/Debug/net8.0/refint/PyroSQL.Data.dll
+/app/PyroSQL.Data/obj/Debug/net8.0/PyroSQL.Data.pdb
+/app/PyroSQL.Data/obj/Debug/net8.0/ref/PyroSQL.Data.dll

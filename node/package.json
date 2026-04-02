@@ -1,6 +1,6 @@
 {
   "name": "pyrosql",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "PyroSQL — Node.js client for PyroSQL via PWire",
   "main": "index.js",
   "types": "index.d.ts",
@@ -10,6 +10,9 @@
   "dependencies": {
     "ffi-napi": "^4.0.3",
     "ref-napi": "^3.0.3"
+  },
+  "optionalDependencies": {
+    "lz4": "^0.6.5"
   },
   "keywords": ["pyrosql", "database", "pwire", "client"],
   "license": "MIT"

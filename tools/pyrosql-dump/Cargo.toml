@@ -1,0 +1,22 @@
+[package]
+name = "pyrosql-dump"
+version = "1.1.0"
+edition = "2021"
+description = "Backup and restore tool for PyroSQL databases (pg_dump equivalent)"
+license = "Apache-2.0"
+
+[lib]
+name = "pyrosql_dump"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pyrosql-dump"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"

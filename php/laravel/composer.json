@@ -1,0 +1,35 @@
+{
+    "name": "pyrosql/laravel",
+    "description": "Laravel database driver for PyroSQL — connects via pdo_pyrosql extension",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1",
+        "illuminate/database": "^10.0|^11.0|^12.0",
+        "illuminate/support": "^10.0|^11.0|^12.0",
+        "ext-pdo_pyrosql": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.0|^11.0",
+        "orchestra/testbench": "^8.0|^9.0|^10.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "PyroSQL\\Laravel\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "PyroSQL\\Laravel\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "PyroSQL\\Laravel\\PyroSqlServiceProvider"
+            ]
+        }
+    },
+    "keywords": ["pyrosql", "laravel", "database", "pdo", "driver"],
+    "homepage": "https://pyrosql.com"
+}

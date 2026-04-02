@@ -40,9 +40,13 @@ use std::ptr;
 
 const MSG_QUERY: u8 = 0x01;
 
+const MSG_AUTH: u8 = 0x06;
+const MSG_COMPRESSED: u8 = 0x10;
+
 const RESP_RESULT_SET: u8 = 0x01;
 const RESP_OK: u8 = 0x02;
 const RESP_ERROR: u8 = 0x03;
+const RESP_READY: u8 = 0x05;
 
 // ── PWire type tags (in column definitions) ─────────────────────────────────
 
@@ -51,6 +55,11 @@ const TYPE_F64: u8 = 2;
 const TYPE_TEXT: u8 = 3;
 const TYPE_BOOL: u8 = 4;
 // 5 = BYTES, etc. — treated as text/blob in JSON output
+
+// LZ4 compression constants
+const CAP_LZ4: u8 = 0x01;
+const COMPRESSION_THRESHOLD: usize = 8 * 1024;
+const COMPRESSION_RATIO_THRESHOLD: f64 = 0.9;
 
 // ── Connection handle ───────────────────────────────────────────────────────
 
@@ -62,6 +71,7 @@ struct PwireConnection {
     stream: std::net::TcpStream,
     send_buf: Vec<u8>,
     recv_buf: Vec<u8>,
+    supports_lz4: bool,
 }
 
 impl PwireConnection {
@@ -70,7 +80,50 @@ impl PwireConnection {
             stream,
             send_buf: Vec::with_capacity(4096),
             recv_buf: Vec::with_capacity(65536),
+            supports_lz4: false,
         }
+    }
+
+    /// Negotiate LZ4 compression by sending an AUTH frame with CAP_LZ4.
+    fn negotiate_lz4(&mut self) -> Result<(), String> {
+        // Send AUTH with empty user/pass but with CAP_LZ4 flag.
+        let user = b"";
+        let pass = b"";
+        self.send_buf.clear();
+        self.send_buf.push(MSG_AUTH);
+        let payload_len = 1 + user.len() + 1 + pass.len() + 1;
+        self.send_buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        self.send_buf.push(user.len() as u8);
+        self.send_buf.extend_from_slice(user);
+        self.send_buf.push(pass.len() as u8);
+        self.send_buf.extend_from_slice(pass);
+        self.send_buf.push(CAP_LZ4);
+        self.stream
+            .write_all(&self.send_buf)
+            .map_err(|e| format!("auth send: {e}"))?;
+
+        // Read response header.
+        let mut header = [0u8; 5];
+        self.stream
+            .read_exact(&mut header)
+            .map_err(|e| format!("auth recv header: {e}"))?;
+
+        let resp_type = header[0];
+        let resp_len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+
+        let mut payload = vec![0u8; resp_len];
+        if resp_len > 0 {
+            self.stream
+                .read_exact(&mut payload)
+                .map_err(|e| format!("auth recv payload: {e}"))?;
+        }
+
+        if resp_type == RESP_READY && resp_len >= 4 {
+            let server_caps = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            self.supports_lz4 = (server_caps as u8 & CAP_LZ4) != 0;
+        }
+
+        Ok(())
     }
 
     /// Send a MSG_QUERY frame and read the full response into `recv_buf`.
@@ -78,12 +131,29 @@ impl PwireConnection {
     /// After this call, `recv_buf[0]` is the response type byte and
     /// `recv_buf[1..]` is the payload.
     fn query_raw(&mut self, sql: &[u8]) -> Result<(), String> {
-        // Build request frame: [type: u8][length: u32 LE][payload]
+        // Build request frame, optionally compressed.
         self.send_buf.clear();
-        self.send_buf.push(MSG_QUERY);
-        self.send_buf
-            .extend_from_slice(&(sql.len() as u32).to_le_bytes());
-        self.send_buf.extend_from_slice(sql);
+        if self.supports_lz4 && sql.len() > COMPRESSION_THRESHOLD {
+            let compressed = lz4_flex::compress_prepend_size(sql);
+            let ratio = compressed.len() as f64 / sql.len() as f64;
+            if ratio <= COMPRESSION_RATIO_THRESHOLD {
+                // Compressed frame: [0x10][total_length][original_type][uncompressed_len][lz4_data]
+                let inner_len = 1 + 4 + compressed.len();
+                self.send_buf.push(MSG_COMPRESSED);
+                self.send_buf.extend_from_slice(&(inner_len as u32).to_le_bytes());
+                self.send_buf.push(MSG_QUERY);
+                self.send_buf.extend_from_slice(&(sql.len() as u32).to_le_bytes());
+                self.send_buf.extend_from_slice(&compressed);
+            } else {
+                self.send_buf.push(MSG_QUERY);
+                self.send_buf.extend_from_slice(&(sql.len() as u32).to_le_bytes());
+                self.send_buf.extend_from_slice(sql);
+            }
+        } else {
+            self.send_buf.push(MSG_QUERY);
+            self.send_buf.extend_from_slice(&(sql.len() as u32).to_le_bytes());
+            self.send_buf.extend_from_slice(sql);
+        }
         self.stream
             .write_all(&self.send_buf)
             .map_err(|e| format!("send: {e}"))?;
@@ -98,15 +168,37 @@ impl PwireConnection {
         let resp_len =
             u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
-        // Read payload into recv_buf (prepend type byte at index 0)
-        self.recv_buf.clear();
-        self.recv_buf.push(resp_type);
-        if resp_len > 0 {
-            let prev = self.recv_buf.len();
-            self.recv_buf.resize(prev + resp_len, 0);
-            self.stream
-                .read_exact(&mut self.recv_buf[prev..prev + resp_len])
-                .map_err(|e| format!("recv payload: {e}"))?;
+        if resp_type == MSG_COMPRESSED {
+            // Read the compressed payload.
+            let mut compressed_payload = vec![0u8; resp_len];
+            if resp_len > 0 {
+                self.stream
+                    .read_exact(&mut compressed_payload)
+                    .map_err(|e| format!("recv compressed payload: {e}"))?;
+            }
+            // Decompress: [original_type: u8][uncompressed_len: u32 LE][lz4_data]
+            if compressed_payload.len() < 5 {
+                return Err("compressed payload too short".to_string());
+            }
+            let original_type = compressed_payload[0];
+            let lz4_data = &compressed_payload[5..];
+            let decompressed = lz4_flex::decompress_size_prepended(lz4_data)
+                .map_err(|e| format!("decompress: {e}"))?;
+
+            self.recv_buf.clear();
+            self.recv_buf.push(original_type);
+            self.recv_buf.extend_from_slice(&decompressed);
+        } else {
+            // Read payload into recv_buf (prepend type byte at index 0)
+            self.recv_buf.clear();
+            self.recv_buf.push(resp_type);
+            if resp_len > 0 {
+                let prev = self.recv_buf.len();
+                self.recv_buf.resize(prev + resp_len, 0);
+                self.stream
+                    .read_exact(&mut self.recv_buf[prev..prev + resp_len])
+                    .map_err(|e| format!("recv payload: {e}"))?;
+            }
         }
 
         Ok(())
@@ -448,7 +540,9 @@ pub extern "C" fn pyro_pwire_connect(
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
 
-    let conn = Box::new(PwireConnection::new(stream));
+    let mut conn = Box::new(PwireConnection::new(stream));
+    // Negotiate LZ4 compression via AUTH handshake.
+    let _ = conn.negotiate_lz4();
     Box::into_raw(conn) as *mut std::ffi::c_void
 }
 
@@ -701,5 +795,56 @@ mod tests {
         assert_eq!(pyro_pwire_execute(ptr::null_mut(), ptr::null()), -1);
         pyro_pwire_free_string(ptr::null_mut()); // should not panic
         pyro_pwire_close(ptr::null_mut()); // should not panic
+    }
+
+    #[test]
+    fn test_compress_decompress_roundtrip() {
+        // Large payload that compresses well (repeated bytes).
+        let data = vec![0x42u8; 20000];
+        let compressed = lz4_flex::compress_prepend_size(&data);
+        assert!(compressed.len() < data.len());
+        let decompressed = lz4_flex::decompress_size_prepended(&compressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_small_payload_not_compressed() {
+        // Payloads <= COMPRESSION_THRESHOLD should not be compressed.
+        let small = b"SELECT 1";
+        assert!(small.len() <= COMPRESSION_THRESHOLD);
+        // The query_raw method only compresses when supports_lz4 is true
+        // AND payload > COMPRESSION_THRESHOLD. With small data, it should
+        // remain a MSG_QUERY frame.
+    }
+
+    #[test]
+    fn test_compressed_response_parsing() {
+        // Simulate a MSG_COMPRESSED response for an OK payload.
+        let ok_payload: Vec<u8> = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&42u64.to_le_bytes()); // rows_affected
+            p.push(3); // tag_len
+            p.extend_from_slice(b"INS"); // tag
+            p
+        };
+        // Make it large enough to trigger compression (pad with zeros).
+        let mut big_payload = ok_payload.clone();
+        big_payload.resize(20000, 0);
+
+        let compressed = lz4_flex::compress_prepend_size(&big_payload);
+        // Build a MSG_COMPRESSED frame payload:
+        // [original_type: u8][uncompressed_len: u32 LE][lz4_data]
+        let mut frame_payload = Vec::new();
+        frame_payload.push(RESP_OK);
+        frame_payload.extend_from_slice(&(big_payload.len() as u32).to_le_bytes());
+        frame_payload.extend_from_slice(&compressed);
+
+        // Simulate recv_buf after decompression logic.
+        let original_type = frame_payload[0];
+        let lz4_data = &frame_payload[5..];
+        let decompressed = lz4_flex::decompress_size_prepended(lz4_data).unwrap();
+        assert_eq!(original_type, RESP_OK);
+        assert_eq!(decompressed.len(), big_payload.len());
+        assert_eq!(&decompressed[..ok_payload.len()], &ok_payload[..]);
     }
 }

@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>12</LangVersion>
+    <RootNamespace>PyroSQL.EntityFrameworkCore</RootNamespace>
+    <AssemblyName>PyroSQL.EntityFrameworkCore</AssemblyName>
+    <PackageId>PyroSQL.EntityFrameworkCore</PackageId>
+    <Version>1.1.0</Version>
+    <Description>Entity Framework Core provider for PyroSQL</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.*" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../PyroSQL.Data/PyroSQL.Data.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PyroSQL.EntityFrameworkCore.Tests" />
+  </ItemGroup>
+
+</Project>

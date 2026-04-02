@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>12</LangVersion>
+    <RootNamespace>PyroSQL.Data</RootNamespace>
+    <AssemblyName>PyroSQL.Data</AssemblyName>
+    <PackageId>PyroSQL.Data</PackageId>
+    <Version>1.1.0</Version>
+    <Description>PyroSQL ADO.NET data provider</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PyroSQL.Data.Tests" />
+  </ItemGroup>
+
+</Project>

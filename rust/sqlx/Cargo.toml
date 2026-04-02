@@ -1,0 +1,17 @@
+[package]
+name = "sqlx-pyrosql"
+version = "1.1.0"
+edition = "2021"
+description = "sqlx driver for PyroSQL — PWire binary protocol"
+license = "MIT"
+repository = "https://github.com/pyrosql/sqlx-pyrosql"
+
+[dependencies]
+sqlx-core = "0.8"
+futures-core = "0.3"
+futures-util = "0.3"
+tokio = { version = "1", features = ["net", "io-util", "rt"] }
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

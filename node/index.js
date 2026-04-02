@@ -114,6 +114,7 @@ class Client {
 
     /**
      * Execute a SELECT query and return the result.
+     * Uses server-side binding when params are provided.
      * @param {string} sql - SQL query with $1, $2, ... placeholders
      * @param {Array} [params=[]] - Parameter values
      * @returns {{ columns: string[], rows: any[][], rows_affected: number }}
@@ -121,8 +122,15 @@ class Client {
      */
     query(sql, params = []) {
         this._checkOpen();
-        const interpolated = this._interpolate(sql, params);
-        const ptr = lib.pyro_pwire_query(this._handle, interpolated);
+        if (params.length > 0) {
+            const stmt = this.prepare(sql);
+            try {
+                return stmt.query(params);
+            } finally {
+                // PreparedStatement is cleaned up by GC via the FFI layer
+            }
+        }
+        const ptr = lib.pyro_pwire_query(this._handle, sql);
         const json = readAndFreeString(ptr);
         if (!json) throw new Error('Query failed: null response');
         const result = JSON.parse(json);
@@ -132,6 +140,7 @@ class Client {
 
     /**
      * Execute a DML statement (INSERT/UPDATE/DELETE).
+     * Uses server-side binding when params are provided.
      * @param {string} sql - SQL statement with $1, $2, ... placeholders
      * @param {Array} [params=[]] - Parameter values
      * @returns {number} Number of rows affected
@@ -139,8 +148,15 @@ class Client {
      */
     execute(sql, params = []) {
         this._checkOpen();
-        const interpolated = this._interpolate(sql, params);
-        const affected = lib.pyro_pwire_execute(this._handle, interpolated);
+        if (params.length > 0) {
+            const stmt = this.prepare(sql);
+            try {
+                return stmt.execute(params);
+            } finally {
+                // PreparedStatement is cleaned up by GC via the FFI layer
+            }
+        }
+        const affected = lib.pyro_pwire_execute(this._handle, sql);
         if (affected < 0) throw new Error('Execute failed');
         return Number(affected);
     }
@@ -189,6 +205,7 @@ class Client {
 
     /**
      * Execute a SELECT query with auto-reconnect on connection failure.
+     * Uses server-side binding when params are provided.
      * @param {string} sql - SQL query with $1, $2, ... placeholders
      * @param {Array} [params=[]] - Parameter values
      * @returns {{ columns: string[], rows: any[][], rows_affected: number }}
@@ -196,8 +213,16 @@ class Client {
      */
     queryRetry(sql, params = []) {
         this._checkOpen();
-        const interpolated = this._interpolate(sql, params);
-        const ptr = lib.pyro_pwire_query_retry(this._handle, interpolated);
+        if (params.length > 0) {
+            // Fall back to prepare+execute for parameterized queries
+            const stmt = this.prepare(sql);
+            try {
+                return stmt.query(params);
+            } finally {
+                // Cleanup handled by GC
+            }
+        }
+        const ptr = lib.pyro_pwire_query_retry(this._handle, sql);
         const json = readAndFreeString(ptr);
         if (!json) throw new Error('Query retry failed: null response');
         const result = JSON.parse(json);
@@ -207,6 +232,7 @@ class Client {
 
     /**
      * Execute a DML statement with auto-reconnect on connection failure.
+     * Uses server-side binding when params are provided.
      * @param {string} sql - SQL statement with $1, $2, ... placeholders
      * @param {Array} [params=[]] - Parameter values
      * @returns {number} Number of rows affected
@@ -214,8 +240,15 @@ class Client {
      */
     executeRetry(sql, params = []) {
         this._checkOpen();
-        const interpolated = this._interpolate(sql, params);
-        const affected = lib.pyro_pwire_execute_retry(this._handle, interpolated);
+        if (params.length > 0) {
+            const stmt = this.prepare(sql);
+            try {
+                return stmt.execute(params);
+            } finally {
+                // Cleanup handled by GC
+            }
+        }
+        const affected = lib.pyro_pwire_execute_retry(this._handle, sql);
         if (affected < 0) throw new Error('Execute retry failed');
         return Number(affected);
     }

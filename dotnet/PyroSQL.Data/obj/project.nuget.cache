@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "SxPTaOvRzNI=",
+  "success": true,
+  "projectFilePath": "/app/PyroSQL.Data/PyroSQL.Data.csproj",
+  "expectedPackageFiles": [
+    "/root/.nuget/packages/k4os.compression.lz4/1.3.8/k4os.compression.lz4.1.3.8.nupkg.sha512"
+  ],
+  "logs": []
+}

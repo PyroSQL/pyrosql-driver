@@ -1,0 +1,26 @@
+{
+    "name": "pyrosql/doctrine-dbal",
+    "description": "Doctrine DBAL driver for PyroSQL — connects via pdo_pyrosql extension",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1",
+        "doctrine/dbal": "^4.0",
+        "ext-pdo_pyrosql": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "PyroSQL\\DoctrineDBAL\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "PyroSQL\\DoctrineDBAL\\Tests\\": "tests/"
+        }
+    },
+    "keywords": ["pyrosql", "doctrine", "dbal", "database", "pdo"],
+    "homepage": "https://pyrosql.com"
+}

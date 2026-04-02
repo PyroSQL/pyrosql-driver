@@ -4,10 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyrosql"
-version = "1.0.0"
+version = "1.1.0"
 description = "PyroSQL Python driver — pure-Python ctypes binding to libpyrosql_ffi_pwire"
 requires-python = ">=3.8"
 license = {text = "BSL-1.1"}
+dependencies = ["lz4>=4.0.0"]
 keywords = ["database", "sql", "pyrosql"]
 classifiers = [
     "Development Status :: 4 - Beta",
