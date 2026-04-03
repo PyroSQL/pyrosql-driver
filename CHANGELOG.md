@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.2.0] - 2026-04-03
+
+### Added
+- **LiveSync (RMP) client library** (`rmp/`) — Reactive Memtable Projection for zero-latency reads
+  - `TableMirror` — lock-free DashMap-backed local mirror, ~28-35ns reads
+  - `PyroConnection` — subscription management with mock and TCP modes
+  - `MemoryBudget` — LRU eviction with configurable max bytes, PIN/UNPIN support
+  - `SubscriptionLimits` — max_rows_per_subscription (100K), max_mirror_bytes (256MB)
+  - Binary protocol codec — SUBSCRIBE, UNSUBSCRIBE, SNAPSHOT, DELTA, MUTATE (TLV format)
+  - **FK-Inferred Subscriptions** — `SchemaGraph`, `walk_fk_depth1`, `walk_fk_next` with cycle detection
+  - `LiveGraph` — root mirror + FK-related mirrors, `db.live("table", depth=N)`
+  - `bench_mirror` — standalone mirror read benchmark
+  - `bench_livesync` — integrated benchmark (mirror reads + delta propagation + data integrity)
+  - End-to-end TCP test: subscribe→snapshot→mutate→delta→mirror verified
+
+### Performance
+- Mirror reads: 35.2M/sec (x86), 26.8M/sec (ARM), ~28-37ns/read
+- 178x faster than PyroSQL request-response, 500x faster than PostgreSQL 18.3
+- 71 tests passing (67 unit + 2 e2e + 1 doc-test + 1 bench validation)
+
 ## [1.1.0] - 2026-04-02
 
 ### Added

@@ -38,13 +38,23 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod budget;
 pub mod connection;
+pub mod fk_walker;
+pub mod limits;
+pub mod live_graph;
 pub mod mirror;
 pub mod protocol;
+pub mod schema;
 
+pub use budget::{BudgetExceeded, MemoryBudget};
 pub use connection::PyroConnection;
+pub use fk_walker::{walk_fk_depth1, walk_fk_next, FkSubscription};
+pub use limits::SubscriptionLimits;
+pub use live_graph::LiveGraph;
 pub use mirror::TableMirror;
 pub use protocol::{
     ColumnInfo, ColumnType, Delta, DeltaOp, Message, Mutate, Predicate, RowChange, Snapshot,
     Subscribe, Unsubscribe,
 };
+pub use schema::{ForeignKey, SchemaGraph};

@@ -1,16 +1,43 @@
 //! Connection manager for RMP subscriptions.
 //!
 //! [`PyroConnection`] manages active subscriptions and their associated
-//! [`TableMirror`] instances. The network layer is currently mocked —
-//! the important piece is the local mirror management and delta application.
+//! [`TableMirror`] instances, with memory budget enforcement and LRU eviction.
 
+use crate::budget::{BudgetExceeded, MemoryBudget};
+use crate::fk_walker::walk_fk_depth1;
+use crate::limits::SubscriptionLimits;
+use crate::live_graph::LiveGraph;
 use crate::mirror::TableMirror;
 use crate::protocol::{
     ColumnInfo, ColumnType, DeltaOp, Predicate, Snapshot,
 };
+use crate::schema::SchemaGraph;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Error returned by subscribe when the memory budget cannot accommodate the new mirror.
+#[derive(Debug)]
+pub enum SubscribeError {
+    /// Memory budget exceeded even after evicting all unpinned mirrors.
+    BudgetExceeded(BudgetExceeded),
+}
+
+impl std::fmt::Display for SubscribeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubscribeError::BudgetExceeded(e) => write!(f, "subscribe failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SubscribeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SubscribeError::BudgetExceeded(e) => Some(e),
+        }
+    }
+}
 
 /// Manages RMP subscriptions and their local mirrors.
 ///
@@ -25,15 +52,33 @@ pub struct PyroConnection {
     next_sub_id: AtomicU64,
     /// Table metadata for mock mode (table_name -> columns).
     table_columns: DashMap<String, Vec<ColumnInfo>>,
+    /// Memory budget manager.
+    budget: Arc<MemoryBudget>,
+    /// Subscription limits.
+    limits: SubscriptionLimits,
 }
 
 impl PyroConnection {
-    /// Create a new connection (mock mode — no actual server).
+    /// Create a new connection with default limits (256 MB budget).
     pub fn new() -> Self {
+        let limits = SubscriptionLimits::default();
         Self {
             mirrors: DashMap::new(),
             next_sub_id: AtomicU64::new(1),
             table_columns: DashMap::new(),
+            budget: Arc::new(MemoryBudget::new(limits.max_mirror_bytes)),
+            limits,
+        }
+    }
+
+    /// Create a new connection with custom subscription limits.
+    pub fn with_limits(limits: SubscriptionLimits) -> Self {
+        Self {
+            mirrors: DashMap::new(),
+            next_sub_id: AtomicU64::new(1),
+            table_columns: DashMap::new(),
+            budget: Arc::new(MemoryBudget::new(limits.max_mirror_bytes)),
+            limits,
         }
     }
 
@@ -48,7 +93,14 @@ impl PyroConnection {
     ///
     /// In mock mode, returns an empty mirror. Use `load_snapshot_for` to
     /// populate it, or apply deltas directly via the mirror's `apply_delta`.
-    pub async fn subscribe(&self, table: &str, _predicate: Predicate) -> Arc<TableMirror> {
+    ///
+    /// If the memory budget is exceeded, unpinned LRU mirrors are evicted first.
+    /// If still over budget after evicting all unpinned mirrors, returns an error.
+    pub async fn subscribe(
+        &self,
+        table: &str,
+        _predicate: Predicate,
+    ) -> Result<Arc<TableMirror>, SubscribeError> {
         let sub_id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let mirror = Arc::new(TableMirror::new(sub_id));
 
@@ -78,8 +130,68 @@ impl PyroConnection {
             rows: vec![],
         });
 
+        // Empty snapshot costs 0 bytes, so budget check is trivially ok.
+        // The real budget check happens when data is loaded via load_snapshot_for.
+        self.budget.touch(sub_id);
         self.mirrors.insert(sub_id, Arc::clone(&mirror));
-        mirror
+        Ok(mirror)
+    }
+
+    /// Load a snapshot into an existing mirror, enforcing memory budget.
+    ///
+    /// If the budget would be exceeded, tries LRU eviction of unpinned mirrors.
+    /// Returns error if still over budget after eviction.
+    pub fn load_snapshot_for(
+        &self,
+        sub_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<(), SubscribeError> {
+        // Calculate memory cost of the incoming snapshot
+        let snapshot_bytes: u64 = snapshot
+            .rows
+            .iter()
+            .map(|(pk, row)| pk.len() as u64 + row.len() as u64 + 64)
+            .sum();
+
+        // Get current mirror memory to account for replacement
+        let current_mirror_bytes = self
+            .mirrors
+            .get(&sub_id)
+            .map(|m| m.memory_bytes())
+            .unwrap_or(0);
+
+        // Net new bytes needed
+        let net_bytes = snapshot_bytes.saturating_sub(current_mirror_bytes);
+
+        if net_bytes > 0 {
+            // Try to allocate within budget
+            if self.budget.try_allocate(net_bytes).is_err() {
+                // Evict unpinned LRU mirrors
+                let candidates = self.budget.eviction_candidates(&self.mirrors, net_bytes);
+                for evict_id in &candidates {
+                    if let Some((_, evicted)) = self.mirrors.remove(evict_id) {
+                        let freed = evicted.memory_bytes();
+                        self.budget.release(freed);
+                        self.budget.remove_tracking(*evict_id);
+                    }
+                }
+                // Retry allocation
+                self.budget
+                    .try_allocate(net_bytes)
+                    .map_err(SubscribeError::BudgetExceeded)?;
+            }
+        } else if current_mirror_bytes > snapshot_bytes {
+            // New snapshot is smaller — release the difference
+            self.budget.release(current_mirror_bytes - snapshot_bytes);
+        }
+
+        // Apply snapshot to mirror
+        if let Some(mirror) = self.mirrors.get(&sub_id) {
+            mirror.load_snapshot(snapshot);
+            self.budget.touch(sub_id);
+        }
+
+        Ok(())
     }
 
     /// Send a mutation to the server (mock: applies directly to local mirror).
@@ -97,6 +209,7 @@ impl PyroConnection {
         // In production, the server sends deltas back on subscription streams.
         for entry in self.mirrors.iter() {
             let mirror = entry.value();
+            let old_mem = mirror.memory_bytes();
             let delta = crate::protocol::Delta {
                 sub_id: mirror.sub_id(),
                 version: mirror.version() + 1,
@@ -107,22 +220,114 @@ impl PyroConnection {
                 }],
             };
             mirror.apply_delta(&delta);
+            let new_mem = mirror.memory_bytes();
+
+            // Update budget tracking
+            if new_mem > old_mem {
+                // Best-effort: if budget exceeded during delta, we still apply
+                // (server already accepted the mutation)
+                let _ = self.budget.try_allocate(new_mem - old_mem);
+            } else if old_mem > new_mem {
+                self.budget.release(old_mem - new_mem);
+            }
         }
     }
 
     /// Unsubscribe from a mirror by subscription ID.
     pub fn unsubscribe(&self, sub_id: u64) {
-        self.mirrors.remove(&sub_id);
+        if let Some((_, mirror)) = self.mirrors.remove(&sub_id) {
+            let freed = mirror.memory_bytes();
+            self.budget.release(freed);
+            self.budget.remove_tracking(sub_id);
+        }
     }
 
     /// Get a mirror by subscription ID.
+    ///
+    /// Also updates the LRU access time for eviction purposes.
     pub fn get_mirror(&self, sub_id: u64) -> Option<Arc<TableMirror>> {
-        self.mirrors.get(&sub_id).map(|entry| Arc::clone(entry.value()))
+        self.mirrors.get(&sub_id).map(|entry| {
+            self.budget.touch(sub_id);
+            Arc::clone(entry.value())
+        })
     }
 
     /// Number of active subscriptions.
     pub fn active_subscriptions(&self) -> usize {
         self.mirrors.len()
+    }
+
+    /// Memory usage stats: (used_bytes, max_bytes).
+    pub fn memory_stats(&self) -> (u64, u64) {
+        (self.budget.used(), self.budget.max_bytes())
+    }
+
+    /// Get a reference to the subscription limits.
+    pub fn limits(&self) -> &SubscriptionLimits {
+        &self.limits
+    }
+}
+
+impl PyroConnection {
+    /// Subscribe to a table and all FK-related tables up to `depth`.
+    ///
+    /// Creates a [`LiveGraph`] with the root subscription and mirrors for all
+    /// tables reachable through foreign keys up to the specified depth.
+    ///
+    /// In mock mode, the root mirror starts empty (like `subscribe`). The
+    /// FK walker uses the root PKs from the predicate to generate depth-1
+    /// subscriptions immediately. Deeper levels require snapshots from
+    /// intermediate tables — use [`walk_fk_next`](crate::fk_walker::walk_fk_next)
+    /// after loading those snapshots.
+    ///
+    /// # Parameters
+    ///
+    /// - `table`: the root table to subscribe to
+    /// - `predicate`: filter for the root subscription
+    /// - `schema`: FK graph for walking related tables
+    /// - `depth`: how many FK levels to walk (-1 = unlimited, 0 = root only)
+    pub async fn live(
+        &self,
+        table: &str,
+        predicate: Predicate,
+        schema: &SchemaGraph,
+        depth: i32,
+    ) -> Result<LiveGraph, SubscribeError> {
+        // Subscribe to root table
+        let root_mirror = self.subscribe(table, predicate.clone()).await?;
+
+        let graph = LiveGraph::new(
+            table.to_string(),
+            Arc::clone(&root_mirror),
+            schema.clone(),
+            depth,
+        );
+
+        // If depth is 0, no FK walking needed
+        if depth == 0 {
+            return Ok(graph);
+        }
+
+        // Extract root PKs from the predicate for depth-1 walking
+        let root_pks = match &predicate {
+            Predicate::Eq { value, .. } => vec![value.clone()],
+            Predicate::All | Predicate::Range { .. } => {
+                // For All/Range predicates, we can't determine specific PKs
+                // until the snapshot arrives. Return the graph as-is and the
+                // caller uses walk_fk_next after loading the root snapshot.
+                return Ok(graph);
+            }
+        };
+
+        // Walk depth 1: create subscriptions for directly related tables
+        let depth1_subs = walk_fk_depth1(schema, table, &root_pks);
+
+        for fk_sub in &depth1_subs {
+            let mirror = self.subscribe(&fk_sub.table, fk_sub.predicate.clone()).await?;
+            graph.add_related(fk_sub.table.clone(), mirror);
+        }
+
+        Ok(graph)
     }
 }
 
@@ -135,11 +340,38 @@ impl Default for PyroConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ColumnType;
+
+    fn make_snapshot(sub_id: u64, version: u64, num_rows: usize) -> Snapshot {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = (0..num_rows)
+            .map(|i| {
+                let pk = (i as u64).to_le_bytes().to_vec();
+                let data = format!("row_{i}").into_bytes();
+                (pk, data)
+            })
+            .collect();
+
+        Snapshot {
+            sub_id,
+            version,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    type_tag: ColumnType::Int64,
+                },
+                ColumnInfo {
+                    name: "data".into(),
+                    type_tag: ColumnType::Text,
+                },
+            ],
+            rows,
+        }
+    }
 
     #[tokio::test]
     async fn subscribe_creates_mirror() {
         let conn = PyroConnection::new();
-        let mirror = conn.subscribe("users", Predicate::All).await;
+        let mirror = conn.subscribe("users", Predicate::All).await.unwrap();
         assert_eq!(mirror.len(), 0);
         assert_eq!(conn.active_subscriptions(), 1);
     }
@@ -147,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn unsubscribe_removes_mirror() {
         let conn = PyroConnection::new();
-        let mirror = conn.subscribe("users", Predicate::All).await;
+        let mirror = conn.subscribe("users", Predicate::All).await.unwrap();
         let sub_id = mirror.sub_id();
         assert_eq!(conn.active_subscriptions(), 1);
 
@@ -159,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn mutate_insert_updates_mirror() {
         let conn = PyroConnection::new();
-        let mirror = conn.subscribe("users", Predicate::All).await;
+        let mirror = conn.subscribe("users", Predicate::All).await.unwrap();
 
         conn.mutate("users", DeltaOp::Insert, b"pk1", Some(b"data1")).await;
 
@@ -170,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn mutate_update_changes_row() {
         let conn = PyroConnection::new();
-        let mirror = conn.subscribe("users", Predicate::All).await;
+        let mirror = conn.subscribe("users", Predicate::All).await.unwrap();
 
         conn.mutate("users", DeltaOp::Insert, b"pk1", Some(b"original")).await;
         conn.mutate("users", DeltaOp::Update, b"pk1", Some(b"updated")).await;
@@ -182,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn mutate_delete_removes_row() {
         let conn = PyroConnection::new();
-        let mirror = conn.subscribe("users", Predicate::All).await;
+        let mirror = conn.subscribe("users", Predicate::All).await.unwrap();
 
         conn.mutate("users", DeltaOp::Insert, b"pk1", Some(b"data1")).await;
         assert_eq!(mirror.len(), 1);
@@ -195,8 +427,8 @@ mod tests {
     #[tokio::test]
     async fn multiple_subscriptions_independent() {
         let conn = PyroConnection::new();
-        let m1 = conn.subscribe("users", Predicate::All).await;
-        let m2 = conn.subscribe("orders", Predicate::All).await;
+        let m1 = conn.subscribe("users", Predicate::All).await.unwrap();
+        let m2 = conn.subscribe("orders", Predicate::All).await.unwrap();
 
         assert_ne!(m1.sub_id(), m2.sub_id());
         assert_eq!(conn.active_subscriptions(), 2);
@@ -227,10 +459,239 @@ mod tests {
             ],
         );
 
-        let mirror = conn.subscribe("metrics", Predicate::All).await;
+        let mirror = conn.subscribe("metrics", Predicate::All).await.unwrap();
         let cols = mirror.columns();
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].name, "ts");
         assert_eq!(cols[1].name, "value");
+    }
+
+    #[tokio::test]
+    async fn budget_tracks_memory() {
+        let limits = SubscriptionLimits {
+            max_rows_per_subscription: 100_000,
+            max_mirror_bytes: 1024 * 1024,
+        };
+        let conn = PyroConnection::with_limits(limits);
+        let mirror = conn.subscribe("users", Predicate::All).await.unwrap();
+        let sub_id = mirror.sub_id();
+
+        // Load 10 rows
+        let snapshot = make_snapshot(sub_id, 1, 10);
+        // Pre-calculate expected bytes
+        let expected_bytes: u64 = snapshot
+            .rows
+            .iter()
+            .map(|(pk, row)| pk.len() as u64 + row.len() as u64 + 64)
+            .sum();
+
+        conn.load_snapshot_for(sub_id, snapshot).unwrap();
+
+        let (used, max) = conn.memory_stats();
+        assert_eq!(used, expected_bytes);
+        assert_eq!(max, 1024 * 1024);
+        assert_eq!(mirror.memory_bytes(), expected_bytes);
+    }
+
+    #[tokio::test]
+    async fn budget_rejects_over_limit() {
+        // Tiny budget: 100 bytes
+        let limits = SubscriptionLimits {
+            max_rows_per_subscription: 100_000,
+            max_mirror_bytes: 100,
+        };
+        let conn = PyroConnection::with_limits(limits);
+        let mirror = conn.subscribe("users", Predicate::All).await.unwrap();
+        let sub_id = mirror.sub_id();
+
+        // Try to load a snapshot that exceeds 100 bytes
+        // Each row: 8 (pk) + 5 (data "row_X") + 64 (overhead) = 77 bytes
+        // 2 rows = 154 bytes > 100 byte budget
+        let snapshot = make_snapshot(sub_id, 1, 2);
+        let result = conn.load_snapshot_for(sub_id, snapshot);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn budget_evicts_lru() {
+        // Budget fits ~2 mirrors but not 3
+        // Each mirror with 1 row: 8 + 5 + 64 = 77 bytes
+        // Budget = 200 bytes (fits 2, not 3)
+        let limits = SubscriptionLimits {
+            max_rows_per_subscription: 100_000,
+            max_mirror_bytes: 200,
+        };
+        let conn = PyroConnection::with_limits(limits);
+
+        // Subscribe mirror 1
+        let m1 = conn.subscribe("t1", Predicate::All).await.unwrap();
+        let s1_id = m1.sub_id();
+        conn.load_snapshot_for(s1_id, make_snapshot(s1_id, 1, 1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Subscribe mirror 2
+        let m2 = conn.subscribe("t2", Predicate::All).await.unwrap();
+        let s2_id = m2.sub_id();
+        conn.load_snapshot_for(s2_id, make_snapshot(s2_id, 1, 1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        assert_eq!(conn.active_subscriptions(), 2);
+
+        // Subscribe mirror 3 — should evict mirror 1 (oldest)
+        let m3 = conn.subscribe("t3", Predicate::All).await.unwrap();
+        let s3_id = m3.sub_id();
+        conn.load_snapshot_for(s3_id, make_snapshot(s3_id, 1, 1)).unwrap();
+
+        // Mirror 1 should have been evicted
+        assert!(conn.get_mirror(s1_id).is_none());
+        // Mirrors 2 and 3 should still exist
+        assert!(conn.get_mirror(s2_id).is_some());
+        assert!(conn.get_mirror(s3_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn budget_respects_pin() {
+        // Budget fits ~2 mirrors
+        let limits = SubscriptionLimits {
+            max_rows_per_subscription: 100_000,
+            max_mirror_bytes: 200,
+        };
+        let conn = PyroConnection::with_limits(limits);
+
+        // Mirror 1: pinned, oldest
+        let m1 = conn.subscribe("t1", Predicate::All).await.unwrap();
+        let s1_id = m1.sub_id();
+        m1.pin();
+        conn.load_snapshot_for(s1_id, make_snapshot(s1_id, 1, 1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Mirror 2: unpinned
+        let m2 = conn.subscribe("t2", Predicate::All).await.unwrap();
+        let s2_id = m2.sub_id();
+        conn.load_snapshot_for(s2_id, make_snapshot(s2_id, 1, 1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Mirror 3: should evict mirror 2 (unpinned), NOT mirror 1 (pinned)
+        let m3 = conn.subscribe("t3", Predicate::All).await.unwrap();
+        let s3_id = m3.sub_id();
+        conn.load_snapshot_for(s3_id, make_snapshot(s3_id, 1, 1)).unwrap();
+
+        // Pinned mirror 1 must survive
+        assert!(conn.get_mirror(s1_id).is_some());
+        // Unpinned mirror 2 should have been evicted
+        assert!(conn.get_mirror(s2_id).is_none());
+        // New mirror 3 should exist
+        assert!(conn.get_mirror(s3_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn pin_unpin_works() {
+        let limits = SubscriptionLimits {
+            max_rows_per_subscription: 100_000,
+            max_mirror_bytes: 200,
+        };
+        let conn = PyroConnection::with_limits(limits);
+
+        // Create and pin mirror 1
+        let m1 = conn.subscribe("t1", Predicate::All).await.unwrap();
+        let s1_id = m1.sub_id();
+        m1.pin();
+        conn.load_snapshot_for(s1_id, make_snapshot(s1_id, 1, 1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Fill with mirror 2
+        let m2 = conn.subscribe("t2", Predicate::All).await.unwrap();
+        let s2_id = m2.sub_id();
+        conn.load_snapshot_for(s2_id, make_snapshot(s2_id, 1, 1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Mirror 3: budget full, but m1 is pinned. Should evict m2.
+        let m3 = conn.subscribe("t3", Predicate::All).await.unwrap();
+        let s3_id = m3.sub_id();
+        conn.load_snapshot_for(s3_id, make_snapshot(s3_id, 1, 1)).unwrap();
+
+        assert!(conn.get_mirror(s1_id).is_some(), "pinned mirror must survive");
+        assert!(conn.get_mirror(s2_id).is_none(), "unpinned mirror should be evicted");
+
+        // Now unpin m1 and fill again — m1 should become evictable
+        m1.unpin();
+        assert!(!m1.is_pinned());
+
+        // Touch m3 so it's more recent than m1
+        let _ = conn.get_mirror(s3_id);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let m4 = conn.subscribe("t4", Predicate::All).await.unwrap();
+        let s4_id = m4.sub_id();
+        conn.load_snapshot_for(s4_id, make_snapshot(s4_id, 1, 1)).unwrap();
+
+        // m1 is now unpinned and oldest — should be evicted
+        assert!(conn.get_mirror(s1_id).is_none(), "unpinned m1 should now be evictable");
+    }
+
+    #[tokio::test]
+    async fn memory_tracking_accurate() {
+        let conn = PyroConnection::new();
+        let mirror = conn.subscribe("users", Predicate::All).await.unwrap();
+        let sub_id = mirror.sub_id();
+
+        // Start with empty
+        assert_eq!(mirror.memory_bytes(), 0);
+
+        // Insert via delta
+        let pk = b"pk_test";
+        let data = b"some_data_here";
+        let expected_after_insert = pk.len() as u64 + data.len() as u64 + 64;
+
+        conn.mutate("users", DeltaOp::Insert, pk, Some(data)).await;
+        assert_eq!(mirror.memory_bytes(), expected_after_insert);
+
+        // Update to larger value
+        let bigger = b"some_much_bigger_data_value_here!!";
+        let expected_after_update = pk.len() as u64 + bigger.len() as u64 + 64;
+
+        conn.mutate("users", DeltaOp::Update, pk, Some(bigger)).await;
+        assert_eq!(mirror.memory_bytes(), expected_after_update);
+
+        // Delete
+        conn.mutate("users", DeltaOp::Delete, pk, None).await;
+        assert_eq!(mirror.memory_bytes(), 0);
+
+        // Memory stats on connection should also reflect
+        let (used, _) = conn.memory_stats();
+        assert_eq!(used, 0);
+
+        let _ = sub_id; // suppress unused warning
+    }
+
+    #[tokio::test]
+    async fn memory_stats_returns_used_and_max() {
+        let limits = SubscriptionLimits {
+            max_rows_per_subscription: 100_000,
+            max_mirror_bytes: 5000,
+        };
+        let conn = PyroConnection::with_limits(limits);
+        let (used, max) = conn.memory_stats();
+        assert_eq!(used, 0);
+        assert_eq!(max, 5000);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_releases_budget() {
+        let limits = SubscriptionLimits {
+            max_rows_per_subscription: 100_000,
+            max_mirror_bytes: 10_000,
+        };
+        let conn = PyroConnection::with_limits(limits);
+        let mirror = conn.subscribe("t1", Predicate::All).await.unwrap();
+        let sub_id = mirror.sub_id();
+
+        conn.load_snapshot_for(sub_id, make_snapshot(sub_id, 1, 10)).unwrap();
+        let (used_before, _) = conn.memory_stats();
+        assert!(used_before > 0);
+
+        conn.unsubscribe(sub_id);
+        let (used_after, _) = conn.memory_stats();
+        assert_eq!(used_after, 0);
     }
 }
