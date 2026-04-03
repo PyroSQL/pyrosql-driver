@@ -1,0 +1,23 @@
+[package]
+name = "pyrosql-rmp"
+version = "0.1.0"
+edition = "2021"
+description = "Reactive Memtable Projection — client-side local mirror for PyroSQL"
+license-file = "../LICENSE"
+repository = "https://github.com/pyrosql/pyrosql-driver"
+homepage = "https://pyrosql.com"
+keywords = ["database", "realtime", "pyrosql", "rmp"]
+categories = ["database"]
+
+[dependencies]
+dashmap = "6"
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[bin]]
+name = "bench_mirror"
+path = "src/bin/bench_mirror.rs"
