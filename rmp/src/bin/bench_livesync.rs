@@ -148,21 +148,8 @@ fn bench_mirror_reads(mirror: &Arc<TableMirror>, threads: usize, duration_secs: 
     (qps, ns)
 }
 
-async fn bench_delta_propagation(addr: &str, iterations: u64) -> (u64, u64) {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-
-    // Subscribe first
-    let sub_msg = encode_message(&Message::Subscribe(Subscribe {
-        sub_id: 99,
-        table: "bench".into(),
-        predicate: Predicate::All,
-    }));
-    stream.write_all(&sub_msg).await.unwrap();
-    let _ = read_frame(&mut stream).await; // consume snapshot
-
-    let mirror = Arc::new(TableMirror::new(99));
-
-    // Measure mutate → delta round trip
+async fn bench_delta_propagation(stream: &mut TcpStream, mirror: &Arc<TableMirror>, iterations: u64) -> (u64, u64) {
+    // Measure mutate → delta round trip on existing connection
     let start = Instant::now();
     for i in 0..iterations {
         let pk = (NUM_ROWS + i).to_le_bytes().to_vec();
@@ -176,7 +163,7 @@ async fn bench_delta_propagation(addr: &str, iterations: u64) -> (u64, u64) {
         stream.write_all(&mutate_msg).await.unwrap();
 
         // Read delta response
-        let frame = read_frame(&mut stream).await.unwrap();
+        let frame = read_frame(stream).await.unwrap();
         let msg = decode_message(&frame).unwrap();
         if let Message::Delta(delta) = msg {
             mirror.apply_delta(&delta);
@@ -197,7 +184,7 @@ async fn bench_delta_propagation(addr: &str, iterations: u64) -> (u64, u64) {
             row: None,
         }));
         stream.write_all(&del_msg).await.unwrap();
-        let _ = read_frame(&mut stream).await;
+        let _ = read_frame(stream).await;
     }
 
     (qps, avg_ns)
@@ -260,12 +247,12 @@ async fn main() {
 
     // ── Test 2: Delta propagation (mutate → delta → mirror update) ──────
     // Need a second connection for this test
-    let (delta_qps, delta_ns) = bench_delta_propagation(&addr, 10_000).await;
+    let (delta_qps, delta_ns) = bench_delta_propagation(&mut stream, &mirror, 100).await;
 
     println!("─── Test 2: Delta Propagation (mutate→server→delta→mirror) ─");
     println!("  Throughput:  {} deltas/sec", delta_qps);
     println!("  Latency:     {}ns/delta (round trip)", delta_ns);
-    println!("  Iterations:  10,000");
+    println!("  Iterations:  100");
     println!();
 
     // ── Test 3: Verify data integrity after deltas ──────────────────────

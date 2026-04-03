@@ -48,7 +48,7 @@ pub mod protocol;
 pub mod schema;
 
 pub use budget::{BudgetExceeded, MemoryBudget};
-pub use connection::PyroConnection;
+pub use connection::{PyroConnection, QueryResult};
 pub use fk_walker::{walk_fk_depth1, walk_fk_next, FkSubscription};
 pub use limits::SubscriptionLimits;
 pub use live_graph::LiveGraph;

@@ -56,6 +56,10 @@ pub struct PyroConnection {
     budget: Arc<MemoryBudget>,
     /// Subscription limits.
     limits: SubscriptionLimits,
+    /// Tracks which table each mirror belongs to (sub_id -> table_name).
+    mirror_tables: DashMap<u64, String>,
+    /// Tracks the predicate for each mirror (sub_id -> predicate).
+    mirror_predicates: DashMap<u64, Predicate>,
 }
 
 impl PyroConnection {
@@ -68,6 +72,8 @@ impl PyroConnection {
             table_columns: DashMap::new(),
             budget: Arc::new(MemoryBudget::new(limits.max_mirror_bytes)),
             limits,
+            mirror_tables: DashMap::new(),
+            mirror_predicates: DashMap::new(),
         }
     }
 
@@ -79,6 +85,8 @@ impl PyroConnection {
             table_columns: DashMap::new(),
             budget: Arc::new(MemoryBudget::new(limits.max_mirror_bytes)),
             limits,
+            mirror_tables: DashMap::new(),
+            mirror_predicates: DashMap::new(),
         }
     }
 
@@ -99,7 +107,7 @@ impl PyroConnection {
     pub async fn subscribe(
         &self,
         table: &str,
-        _predicate: Predicate,
+        predicate: Predicate,
     ) -> Result<Arc<TableMirror>, SubscribeError> {
         let sub_id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let mirror = Arc::new(TableMirror::new(sub_id));
@@ -133,6 +141,8 @@ impl PyroConnection {
         // Empty snapshot costs 0 bytes, so budget check is trivially ok.
         // The real budget check happens when data is loaded via load_snapshot_for.
         self.budget.touch(sub_id);
+        self.mirror_tables.insert(sub_id, table.to_string());
+        self.mirror_predicates.insert(sub_id, predicate);
         self.mirrors.insert(sub_id, Arc::clone(&mirror));
         Ok(mirror)
     }
@@ -239,6 +249,8 @@ impl PyroConnection {
             let freed = mirror.memory_bytes();
             self.budget.release(freed);
             self.budget.remove_tracking(sub_id);
+            self.mirror_tables.remove(&sub_id);
+            self.mirror_predicates.remove(&sub_id);
         }
     }
 
@@ -265,6 +277,77 @@ impl PyroConnection {
     /// Get a reference to the subscription limits.
     pub fn limits(&self) -> &SubscriptionLimits {
         &self.limits
+    }
+}
+
+/// Result from a transparent query that auto-upgrades to LiveSync.
+pub struct QueryResult {
+    /// The mirror backing this query result.
+    mirror: Arc<TableMirror>,
+    /// The predicate used for filtering (if the mirror covers more than requested).
+    predicate: Predicate,
+}
+
+impl QueryResult {
+    /// Create a QueryResult from a mirror and predicate.
+    pub fn from_mirror(mirror: Arc<TableMirror>, predicate: &Predicate) -> Self {
+        Self {
+            mirror,
+            predicate: predicate.clone(),
+        }
+    }
+
+    /// Number of rows matching the predicate in the mirror.
+    pub fn len(&self) -> usize {
+        match &self.predicate {
+            Predicate::All => self.mirror.len(),
+            Predicate::Eq { value, .. } => {
+                if self.mirror.get(value).is_some() {
+                    1
+                } else {
+                    0
+                }
+            }
+            Predicate::Range { start, end } => {
+                // Must iterate to count matching rows.
+                self.mirror
+                    .iter()
+                    .filter(|(pk, _)| pk.as_slice() >= start.as_slice() && pk.as_slice() <= end.as_slice())
+                    .count()
+            }
+        }
+    }
+
+    /// Whether the result is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get a specific row by primary key.
+    pub fn get(&self, pk: &[u8]) -> Option<dashmap::mapref::one::Ref<'_, Vec<u8>, Vec<u8>>> {
+        self.mirror.get(pk)
+    }
+
+    /// Iterate all rows matching the predicate.
+    pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> + '_ {
+        let pred = self.predicate.clone();
+        self.mirror.iter().filter(move |(pk, _)| match &pred {
+            Predicate::All => true,
+            Predicate::Eq { value, .. } => pk.as_slice() == value.as_slice(),
+            Predicate::Range { start, end } => {
+                pk.as_slice() >= start.as_slice() && pk.as_slice() <= end.as_slice()
+            }
+        })
+    }
+
+    /// The subscription ID of the underlying mirror.
+    pub fn sub_id(&self) -> u64 {
+        self.mirror.sub_id()
+    }
+
+    /// The current version of the underlying mirror.
+    pub fn version(&self) -> u64 {
+        self.mirror.version()
     }
 }
 
@@ -328,6 +411,67 @@ impl PyroConnection {
         }
 
         Ok(graph)
+    }
+}
+
+impl PyroConnection {
+    /// Query that auto-upgrades to LiveSync for repeated patterns.
+    ///
+    /// First call: sends SUBSCRIBE, returns from mirror after snapshot.
+    /// Subsequent calls: reads directly from mirror (~28ns).
+    pub async fn query(
+        &self,
+        table: &str,
+        predicate: Predicate,
+    ) -> Result<QueryResult, SubscribeError> {
+        // Check if we already have a mirror that covers this query.
+        if let Some(mirror) = self.find_covering_mirror(table, &predicate) {
+            return Ok(QueryResult::from_mirror(mirror, &predicate));
+        }
+        // First time -- subscribe and return from mirror.
+        let mirror = self.subscribe(table, predicate.clone()).await?;
+        Ok(QueryResult::from_mirror(mirror, &predicate))
+    }
+
+    /// Check if any existing mirror covers this query.
+    ///
+    /// A mirror covers a query if:
+    /// - It is subscribed to the same table (tracked via table_columns key)
+    /// - Its predicate is a superset of the query predicate
+    ///
+    /// In mock mode, we use a simple heuristic: a mirror with Predicate::All
+    /// covers any query on the same table. Specific predicates only cover
+    /// themselves.
+    fn find_covering_mirror(
+        &self,
+        table: &str,
+        predicate: &Predicate,
+    ) -> Option<Arc<TableMirror>> {
+        // Track (table, sub_id) associations for covering queries.
+        // In mock mode, we check all mirrors. In production, the server would
+        // handle hierarchy and return a "covered" response.
+        for entry in self.mirrors.iter() {
+            let mirror = entry.value();
+            let sub_id = *entry.key();
+
+            // Check if this mirror belongs to the same table.
+            // We use the mirror_tables map to track table associations.
+            if let Some(mirror_table) = self.mirror_tables.get(&sub_id) {
+                if mirror_table.value() == table {
+                    // Check predicate coverage: All covers everything.
+                    if let Some(mirror_pred) = self.mirror_predicates.get(&sub_id) {
+                        match mirror_pred.value() {
+                            Predicate::All => return Some(Arc::clone(mirror)),
+                            _ if mirror_pred.value() == predicate => {
+                                return Some(Arc::clone(mirror))
+                            }
+                            _ => continue,
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -693,5 +837,82 @@ mod tests {
         conn.unsubscribe(sub_id);
         let (used_after, _) = conn.memory_stats();
         assert_eq!(used_after, 0);
+    }
+
+    // ── Transparent query upgrade tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn query_auto_subscribes() {
+        let conn = PyroConnection::new();
+        assert_eq!(conn.active_subscriptions(), 0);
+
+        let result = conn.query("users", Predicate::All).await.unwrap();
+        assert_eq!(conn.active_subscriptions(), 1);
+        // Empty mirror initially in mock mode.
+        assert_eq!(result.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn query_reuses_mirror() {
+        let conn = PyroConnection::new();
+
+        // First query creates a subscription with Predicate::All.
+        let r1 = conn.query("users", Predicate::All).await.unwrap();
+        let sub_id_1 = r1.sub_id();
+        assert_eq!(conn.active_subscriptions(), 1);
+
+        // Second query on the same table with same predicate reuses the mirror.
+        let r2 = conn.query("users", Predicate::All).await.unwrap();
+        let sub_id_2 = r2.sub_id();
+        assert_eq!(conn.active_subscriptions(), 1);
+        assert_eq!(sub_id_1, sub_id_2);
+    }
+
+    #[tokio::test]
+    async fn query_covered_by_table_sub() {
+        let conn = PyroConnection::new();
+
+        // First: subscribe to ALL rows on "users".
+        let _all_mirror = conn.query("users", Predicate::All).await.unwrap();
+        assert_eq!(conn.active_subscriptions(), 1);
+
+        // Second: query a specific row -- should be covered by the ALL subscription.
+        let r2 = conn
+            .query(
+                "users",
+                Predicate::Eq {
+                    column: "id".into(),
+                    value: vec![0, 0, 0, 42],
+                },
+            )
+            .await
+            .unwrap();
+        // Should NOT create a new subscription -- the ALL mirror covers it.
+        assert_eq!(conn.active_subscriptions(), 1);
+        // The result should use the same mirror.
+        assert_eq!(r2.sub_id(), _all_mirror.sub_id());
+    }
+
+    #[tokio::test]
+    async fn query_different_table_creates_new_sub() {
+        let conn = PyroConnection::new();
+
+        let _r1 = conn.query("users", Predicate::All).await.unwrap();
+        let _r2 = conn.query("orders", Predicate::All).await.unwrap();
+        assert_eq!(conn.active_subscriptions(), 2);
+    }
+
+    #[tokio::test]
+    async fn query_result_iterates_filtered() {
+        let conn = PyroConnection::new();
+
+        // Subscribe to ALL, then insert some data.
+        let r = conn.query("users", Predicate::All).await.unwrap();
+        conn.mutate("users", DeltaOp::Insert, b"pk1", Some(b"data1")).await;
+        conn.mutate("users", DeltaOp::Insert, b"pk2", Some(b"data2")).await;
+
+        // Query with All should see all rows.
+        let all: Vec<_> = r.iter().collect();
+        assert_eq!(all.len(), 2);
     }
 }

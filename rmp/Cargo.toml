@@ -25,3 +25,11 @@ path = "src/bin/bench_mirror.rs"
 [[bin]]
 name = "bench_livesync"
 path = "src/bin/bench_livesync.rs"
+
+[[bin]]
+name = "bench_realistic"
+path = "src/bin/bench_realistic.rs"
+
+[[bin]]
+name = "bench_fk_walker"
+path = "src/bin/bench_fk_walker.rs"
