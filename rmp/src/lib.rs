@@ -43,18 +43,22 @@ pub mod connection;
 pub mod fk_walker;
 pub mod limits;
 pub mod live_graph;
+pub mod local_query;
 pub mod mirror;
 pub mod protocol;
+pub mod row;
 pub mod schema;
 
 pub use budget::{BudgetExceeded, MemoryBudget};
-pub use connection::{PyroConnection, QueryResult};
+pub use connection::{PyroConnection, QueryResult, SqlQueryResult};
 pub use fk_walker::{walk_fk_depth1, walk_fk_next, FkSubscription};
 pub use limits::SubscriptionLimits;
 pub use live_graph::LiveGraph;
+pub use local_query::{try_execute_local, LocalResult};
 pub use mirror::TableMirror;
 pub use protocol::{
     ColumnInfo, ColumnType, Delta, DeltaOp, Message, Mutate, Predicate, RowChange, Snapshot,
     Subscribe, Unsubscribe,
 };
+pub use row::{encode_row, Row, Value};
 pub use schema::{ForeignKey, SchemaGraph};

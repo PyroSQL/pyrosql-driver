@@ -7,10 +7,12 @@ use crate::budget::{BudgetExceeded, MemoryBudget};
 use crate::fk_walker::walk_fk_depth1;
 use crate::limits::SubscriptionLimits;
 use crate::live_graph::LiveGraph;
+use crate::local_query::{self, LocalResult};
 use crate::mirror::TableMirror;
 use crate::protocol::{
     ColumnInfo, ColumnType, DeltaOp, Predicate, Snapshot,
 };
+use crate::row::Row;
 use crate::schema::SchemaGraph;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +62,10 @@ pub struct PyroConnection {
     mirror_tables: DashMap<u64, String>,
     /// Tracks the predicate for each mirror (sub_id -> predicate).
     mirror_predicates: DashMap<u64, Predicate>,
+    /// Named mirrors for local query engine (table_name -> mirror).
+    named_mirrors: DashMap<String, Arc<TableMirror>>,
+    /// Column schemas for local query decoding (table_name -> columns).
+    schemas: DashMap<String, Vec<ColumnInfo>>,
 }
 
 impl PyroConnection {
@@ -74,6 +80,8 @@ impl PyroConnection {
             limits,
             mirror_tables: DashMap::new(),
             mirror_predicates: DashMap::new(),
+            named_mirrors: DashMap::new(),
+            schemas: DashMap::new(),
         }
     }
 
@@ -87,6 +95,8 @@ impl PyroConnection {
             limits,
             mirror_tables: DashMap::new(),
             mirror_predicates: DashMap::new(),
+            named_mirrors: DashMap::new(),
+            schemas: DashMap::new(),
         }
     }
 
@@ -144,6 +154,11 @@ impl PyroConnection {
         self.mirror_tables.insert(sub_id, table.to_string());
         self.mirror_predicates.insert(sub_id, predicate);
         self.mirrors.insert(sub_id, Arc::clone(&mirror));
+
+        // Track named mirror and schema for local query engine
+        self.named_mirrors.insert(table.to_string(), Arc::clone(&mirror));
+        self.schemas.insert(table.to_string(), mirror.columns());
+
         Ok(mirror)
     }
 
@@ -195,8 +210,12 @@ impl PyroConnection {
             self.budget.release(current_mirror_bytes - snapshot_bytes);
         }
 
-        // Apply snapshot to mirror
+        // Apply snapshot to mirror and update schema
         if let Some(mirror) = self.mirrors.get(&sub_id) {
+            // Update schema from snapshot columns
+            if let Some(table_name) = self.mirror_tables.get(&sub_id) {
+                self.schemas.insert(table_name.value().clone(), snapshot.columns.clone());
+            }
             mirror.load_snapshot(snapshot);
             self.budget.touch(sub_id);
         }
@@ -249,7 +268,10 @@ impl PyroConnection {
             let freed = mirror.memory_bytes();
             self.budget.release(freed);
             self.budget.remove_tracking(sub_id);
-            self.mirror_tables.remove(&sub_id);
+            if let Some((_, table_name)) = self.mirror_tables.remove(&sub_id) {
+                self.named_mirrors.remove(&table_name);
+                self.schemas.remove(&table_name);
+            }
             self.mirror_predicates.remove(&sub_id);
         }
     }
@@ -411,6 +433,66 @@ impl PyroConnection {
         }
 
         Ok(graph)
+    }
+}
+
+/// Result from a SQL query executed against local mirrors.
+pub struct SqlQueryResult {
+    /// Column metadata for the result set.
+    pub columns: Vec<ColumnInfo>,
+    /// Decoded rows.
+    pub rows: Vec<Row>,
+}
+
+impl SqlQueryResult {
+    /// Create from a [`LocalResult`].
+    pub fn from_local(local: LocalResult) -> Self {
+        Self {
+            columns: local.columns,
+            rows: local.rows,
+        }
+    }
+
+    /// Number of rows in the result.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the result is empty.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+impl PyroConnection {
+    /// Execute a SQL or FIND query against local mirrors.
+    ///
+    /// Tries to resolve the query locally first using the local query engine.
+    /// Returns `Some(SqlQueryResult)` if resolved locally, `None` if the query
+    /// is too complex and should be delegated to the server.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // SQL syntax
+    /// let result = conn.query_sql("SELECT * FROM products WHERE id = 42").unwrap();
+    ///
+    /// // PyroSQL native syntax
+    /// let result = conn.query_sql("FIND products WHERE id = 42").unwrap();
+    /// ```
+    pub fn query_sql(&self, sql: &str) -> Option<SqlQueryResult> {
+        local_query::try_execute_local(sql, &self.named_mirrors, &self.schemas)
+            .map(SqlQueryResult::from_local)
+    }
+
+    /// Get a reference to the named mirrors map (for advanced/direct use).
+    pub fn named_mirrors(&self) -> &DashMap<String, Arc<TableMirror>> {
+        &self.named_mirrors
+    }
+
+    /// Get a reference to the schemas map.
+    pub fn schemas(&self) -> &DashMap<String, Vec<ColumnInfo>> {
+        &self.schemas
     }
 }
 
