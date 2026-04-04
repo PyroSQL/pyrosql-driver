@@ -157,6 +157,82 @@ impl Row {
         Row { values }
     }
 
+    /// Decode only selected columns from a raw row (projection pushdown).
+    ///
+    /// `col_indices` lists which column indices to decode. The result `Row`
+    /// contains values in the order of `col_indices`, skipping unneeded
+    /// columns at the byte level using field-length headers rather than
+    /// decoding them.
+    pub fn decode_projected(raw: &[u8], columns: &[ColumnInfo], col_indices: &[usize]) -> Self {
+        if col_indices.is_empty() {
+            return Row { values: Vec::new() };
+        }
+        if raw.len() < 4 {
+            return Row {
+                values: vec![Value::Null; col_indices.len()],
+            };
+        }
+        let num_cols = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+
+        // Find the max column index we need so we can stop scanning early
+        let max_needed = *col_indices.iter().max().unwrap();
+
+        // Build a fast lookup: which positions in col_indices want column i?
+        // For small col_indices this is faster than a HashSet.
+        let mut values = vec![Value::Null; col_indices.len()];
+        let mut pos = 4;
+
+        for i in 0..num_cols {
+            if i > max_needed {
+                break; // No more columns needed, stop scanning
+            }
+            if pos + 4 > raw.len() {
+                break;
+            }
+            let field_len =
+                u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]);
+            pos += 4;
+
+            if field_len == NULL_SENTINEL {
+                // Check if this column is needed
+                for (out_idx, &ci) in col_indices.iter().enumerate() {
+                    if ci == i {
+                        values[out_idx] = Value::Null;
+                    }
+                }
+                continue;
+            }
+
+            let len = field_len as usize;
+            if pos + len > raw.len() {
+                break;
+            }
+
+            // Check if any output position wants this column
+            let mut needed = false;
+            for &ci in col_indices {
+                if ci == i {
+                    needed = true;
+                    break;
+                }
+            }
+
+            if needed && i < columns.len() {
+                let data = &raw[pos..pos + len];
+                let val = decode_field(data, columns[i].type_tag);
+                for (out_idx, &ci) in col_indices.iter().enumerate() {
+                    if ci == i {
+                        values[out_idx] = val.clone();
+                    }
+                }
+            }
+            // Skip the field data regardless
+            pos += len;
+        }
+
+        Row { values }
+    }
+
     /// Get a value by column index.
     pub fn get(&self, idx: usize) -> &Value {
         &self.values[idx]

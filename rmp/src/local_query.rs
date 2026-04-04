@@ -21,11 +21,63 @@
 
 use crate::mirror::TableMirror;
 use crate::protocol::{ColumnInfo, ColumnType};
-use crate::row::{encode_row, raw_field_decode, raw_field_eq, Row, Value};
+use crate::row::{encode_row, raw_field_decode, raw_field_eq, raw_field_offset, Row, Value};
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+// ── OrderableValue: Value wrapper with total Ord for BTreeMap keys ───────────
+
+/// A wrapper around `Value` that implements `Eq + Ord` for use as BTreeMap keys.
+/// NaN floats are ordered after all other floats (consistent with total_cmp).
+#[derive(Debug, Clone)]
+struct OrderableValue(Value);
+
+impl PartialEq for OrderableValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for OrderableValue {}
+
+impl PartialOrd for OrderableValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderableValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (&self.0, &other.0) {
+            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+            (Value::Null, _) => std::cmp::Ordering::Less,
+            (_, Value::Null) => std::cmp::Ordering::Greater,
+            (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
+            (Value::Float64(a), Value::Float64(b)) => a.total_cmp(b),
+            (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+            (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+            // Cross-type: Int64 vs Float64
+            (Value::Int64(a), Value::Float64(b)) => (*a as f64).total_cmp(b),
+            (Value::Float64(a), Value::Int64(b)) => a.total_cmp(&(*b as f64)),
+            // Different types: order by a type tag number for deterministic ordering
+            _ => type_tag_ord(&self.0).cmp(&type_tag_ord(&other.0)),
+        }
+    }
+}
+
+/// Assign a stable numeric tag to each Value variant for cross-type Ord.
+fn type_tag_ord(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int64(_) => 2,
+        Value::Float64(_) => 3,
+        Value::Text(_) => 4,
+        Value::Bytes(_) => 5,
+    }
+}
 
 /// Global query pattern cache: SQL string → parsed SELECT.
 /// Avoids re-parsing the same SQL pattern on every call.
@@ -39,9 +91,18 @@ fn query_cache() -> &'static RwLock<HashMap<String, Option<ParsedSelect>>> {
 ///
 /// Maps `(column_index, stringified_value)` to a list of PK bytes, enabling
 /// O(1) equality lookups on any column without scanning the full mirror.
+///
+/// Also maintains lazy range indexes (BTreeMap per column) for range predicates
+/// and sorted indexes (Vec of PKs sorted by column value) for ORDER BY + LIMIT.
 pub struct MirrorIndex {
     /// Maps (col_idx, value_key) → Vec<pk_bytes>.
     by_column: HashMap<(usize, Vec<u8>), Vec<Vec<u8>>>,
+    /// Range indexes: col_idx → BTreeMap<OrderableValue, Vec<pk_bytes>>.
+    /// Built lazily on first range query against a column.
+    range_indexes: HashMap<usize, BTreeMap<OrderableValue, Vec<Vec<u8>>>>,
+    /// Sorted indexes: col_idx → Vec<(OrderableValue, pk_bytes)> sorted by value.
+    /// Built lazily on first ORDER BY query against a column.
+    sorted_indexes: HashMap<usize, Vec<(OrderableValue, Vec<u8>)>>,
     /// The mirror version at the time this index was built.
     version: u64,
     /// The mirror row count at the time this index was built.
@@ -68,6 +129,8 @@ impl MirrorIndex {
 
         Self {
             by_column,
+            range_indexes: HashMap::new(),
+            sorted_indexes: HashMap::new(),
             version,
             row_count,
         }
@@ -99,6 +162,80 @@ impl MirrorIndex {
             Value::Bytes(b) => b.clone(),
             Value::Null => vec![0xFF, 0xFF, 0xFF, 0xFF],
         }
+    }
+
+    /// Build a range index (BTreeMap) for a specific column from mirror data.
+    fn build_range_index(mirror: &TableMirror, columns: &[ColumnInfo], col_idx: usize) -> BTreeMap<OrderableValue, Vec<Vec<u8>>> {
+        let mut btree: BTreeMap<OrderableValue, Vec<Vec<u8>>> = BTreeMap::new();
+        let col_type = columns[col_idx].type_tag;
+        for (pk, raw) in mirror.iter() {
+            let val = raw_field_decode(&raw, col_idx, col_type);
+            btree.entry(OrderableValue(val)).or_default().push(pk);
+        }
+        btree
+    }
+
+    /// Build a sorted index (Vec sorted by column value) for a specific column.
+    fn build_sorted_index(mirror: &TableMirror, columns: &[ColumnInfo], col_idx: usize) -> Vec<(OrderableValue, Vec<u8>)> {
+        let col_type = columns[col_idx].type_tag;
+        let mut entries: Vec<(OrderableValue, Vec<u8>)> = mirror
+            .iter()
+            .map(|(pk, raw)| {
+                let val = raw_field_decode(&raw, col_idx, col_type);
+                (OrderableValue(val), pk)
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    /// Get range query results for a column with a comparison operator.
+    /// Returns PK bytes for matching rows, or None if range index not available.
+    fn range_lookup(
+        &self,
+        col_idx: usize,
+        op: &CmpOp,
+        literal: &Value,
+    ) -> Option<Vec<Vec<u8>>> {
+        let btree = self.range_indexes.get(&col_idx)?;
+        let key = OrderableValue(literal.clone());
+        let pks: Vec<Vec<u8>> = match op {
+            CmpOp::Gt => btree
+                .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+                .flat_map(|(_, pks)| pks.iter().cloned())
+                .collect(),
+            CmpOp::Gte => btree
+                .range((std::ops::Bound::Included(key), std::ops::Bound::Unbounded))
+                .flat_map(|(_, pks)| pks.iter().cloned())
+                .collect(),
+            CmpOp::Lt => btree
+                .range((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(key)))
+                .flat_map(|(_, pks)| pks.iter().cloned())
+                .collect(),
+            CmpOp::Lte => btree
+                .range((std::ops::Bound::Unbounded, std::ops::Bound::Included(key)))
+                .flat_map(|(_, pks)| pks.iter().cloned())
+                .collect(),
+            _ => return None,
+        };
+        Some(pks)
+    }
+
+    /// Get the top-N PKs by column value for ORDER BY + LIMIT.
+    /// Returns None if sorted index not available for this column.
+    fn sorted_lookup(
+        &self,
+        col_idx: usize,
+        descending: bool,
+        limit: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        let sorted = self.sorted_indexes.get(&col_idx)?;
+        let pks: Vec<Vec<u8>> = if descending {
+            sorted.iter().rev().take(limit).map(|(_, pk)| pk.clone()).collect()
+        } else {
+            sorted.iter().take(limit).map(|(_, pk)| pk.clone()).collect()
+        };
+        Some(pks)
     }
 }
 
@@ -144,6 +281,86 @@ fn index_lookup_eq(
     let cache = index_cache().read();
     let idx = cache.get(&key)?;
     idx.lookup(col_idx, literal).cloned()
+}
+
+/// Ensure the range index exists for a specific column, building it lazily if needed.
+fn ensure_range_index(
+    table: &str,
+    mirror: &TableMirror,
+    columns: &[ColumnInfo],
+    col_idx: usize,
+) {
+    // First ensure the base SI index exists
+    get_or_build_index(table, mirror, columns);
+    let key = (table.to_string(), mirror.instance_id());
+    // Check if range index already exists for this column
+    {
+        let cache = index_cache().read();
+        if let Some(idx) = cache.get(&key) {
+            if idx.range_indexes.contains_key(&col_idx) {
+                return;
+            }
+        }
+    }
+    // Build range index under write lock
+    let btree = MirrorIndex::build_range_index(mirror, columns, col_idx);
+    let mut cache = index_cache().write();
+    if let Some(idx) = cache.get_mut(&key) {
+        idx.range_indexes.insert(col_idx, btree);
+    }
+}
+
+/// Look up PKs matching a range condition via the range index.
+fn index_lookup_range(
+    table: &str,
+    mirror: &TableMirror,
+    col_idx: usize,
+    op: &CmpOp,
+    literal: &Value,
+) -> Option<Vec<Vec<u8>>> {
+    let key = (table.to_string(), mirror.instance_id());
+    let cache = index_cache().read();
+    let idx = cache.get(&key)?;
+    idx.range_lookup(col_idx, op, literal)
+}
+
+/// Ensure the sorted index exists for a specific column, building it lazily if needed.
+fn ensure_sorted_index(
+    table: &str,
+    mirror: &TableMirror,
+    columns: &[ColumnInfo],
+    col_idx: usize,
+) {
+    // First ensure the base SI index exists
+    get_or_build_index(table, mirror, columns);
+    let key = (table.to_string(), mirror.instance_id());
+    {
+        let cache = index_cache().read();
+        if let Some(idx) = cache.get(&key) {
+            if idx.sorted_indexes.contains_key(&col_idx) {
+                return;
+            }
+        }
+    }
+    let sorted = MirrorIndex::build_sorted_index(mirror, columns, col_idx);
+    let mut cache = index_cache().write();
+    if let Some(idx) = cache.get_mut(&key) {
+        idx.sorted_indexes.insert(col_idx, sorted);
+    }
+}
+
+/// Look up top-N PKs by column value for ORDER BY + LIMIT.
+fn index_lookup_sorted(
+    table: &str,
+    mirror: &TableMirror,
+    col_idx: usize,
+    descending: bool,
+    limit: usize,
+) -> Option<Vec<Vec<u8>>> {
+    let key = (table.to_string(), mirror.instance_id());
+    let cache = index_cache().read();
+    let idx = cache.get(&key)?;
+    idx.sorted_lookup(col_idx, descending, limit)
 }
 
 /// Result of a locally-executed query.
@@ -1045,7 +1262,46 @@ fn matches_raw(raw: &[u8], conditions: &[ResolvedCondition]) -> bool {
     true
 }
 
-/// Execute a simple single-table SELECT.
+/// Compute the column indices needed for projection pushdown.
+/// Returns None if SELECT * (all columns needed).
+fn compute_projection_indices(
+    select_cols: &[SelectCol],
+    columns: &[ColumnInfo],
+    order_by: Option<&OrderBy>,
+) -> Option<Vec<usize>> {
+    if select_cols.len() == 1 && select_cols[0].name == "*" {
+        return None; // All columns
+    }
+    let mut indices: Vec<usize> = Vec::new();
+    for sc in select_cols {
+        if let Some(idx) = find_column_idx(&sc.name, columns) {
+            if !indices.contains(&idx) {
+                indices.push(idx);
+            }
+        }
+    }
+    // If ORDER BY references a column not in SELECT, add it for sorting
+    if let Some(ob) = order_by {
+        if let Some(idx) = find_column_idx(&ob.column, columns) {
+            if !indices.contains(&idx) {
+                indices.push(idx);
+            }
+        }
+    }
+    Some(indices)
+}
+
+/// Execute a simple single-table SELECT with three optimizations:
+///
+/// 1. **Range index**: BTreeMap-based sorted index for range predicates (>, <, >=, <=).
+///    Built lazily on first range query for a given column, then reused for subsequent queries.
+///
+/// 2. **Pre-sorted index for ORDER BY + LIMIT**: Vec of PKs sorted by column value.
+///    Built lazily on first ORDER BY query, enabling O(LIMIT) retrieval instead of O(N log N) sort.
+///    Falls back to partial sort (select_nth_unstable) when index is not yet available.
+///
+/// 3. **Projection pushdown**: When SELECT specifies a subset of columns, only decode those
+///    columns from each raw row, skipping unneeded fields at the byte level.
 fn execute_simple(
     parsed: &ParsedSelect,
     mirrors: &DashMap<String, Arc<TableMirror>>,
@@ -1056,23 +1312,75 @@ fn execute_simple(
     let columns = schemas.get(table)?;
     let columns = columns.value().clone();
 
-    // ── Optimization 1+2: Secondary index for equality conditions ──────
     // Pre-resolve conditions to avoid repeated string parsing per row.
     let resolved = resolve_conditions(&parsed.where_conds, &columns, &parsed.from_table);
 
+    // ── Fast path: ORDER BY col [ASC|DESC] LIMIT N with no WHERE ─────────
+    // Use pre-sorted index to return top-N directly without scanning/decoding all rows.
+    if parsed.where_conds.is_empty() {
+        if let Some(ref order) = parsed.order_by {
+            if let Some(limit) = parsed.limit {
+                if let Some(order_col_idx) = find_column_idx(&order.column, &columns) {
+                    // Ensure sorted index exists (lazy build on first call)
+                    ensure_sorted_index(table, &mirror, &columns, order_col_idx);
+                    if let Some(pks) = index_lookup_sorted(table, &mirror, order_col_idx, order.descending, limit) {
+                        // Fetch and decode only the top-N rows
+                        let proj = compute_projection_indices(&parsed.select_cols, &columns, None);
+                        let mut rows = Vec::with_capacity(pks.len());
+                        for pk in &pks {
+                            if let Some(row_ref) = mirror.get(pk) {
+                                let row = match &proj {
+                                    Some(indices) => Row::decode_projected(row_ref.value(), &columns, indices),
+                                    None => Row::decode(row_ref.value(), &columns),
+                                };
+                                rows.push(row);
+                            }
+                        }
+                        // Project columns (remap indices if needed)
+                        let (result_columns, rows) = if proj.is_some() {
+                            project_from_projected(&parsed.select_cols, &columns, rows, parsed.order_by.as_ref())
+                        } else {
+                            project_columns(&parsed.select_cols, &columns, rows, None, &parsed.from_table)
+                        };
+                        return Some(LocalResult { columns: result_columns, rows });
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Main path: WHERE filtering with index acceleration ────────────────
     let mut rows: Vec<Row> = if let Some(ref resolved_conds) = resolved {
         if resolved_conds.is_empty() {
-            // No WHERE: decode all rows
-            mirror
+            // No WHERE, no ORDER BY+LIMIT fast path: decode all rows with projection
+            let proj = compute_projection_indices(&parsed.select_cols, &columns, parsed.order_by.as_ref());
+            let raw_rows: Vec<Row> = mirror
                 .iter()
-                .map(|(_pk, raw)| Row::decode(&raw, &columns))
-                .collect()
+                .map(|(_pk, raw)| match &proj {
+                    Some(indices) => Row::decode_projected(&raw, &columns, indices),
+                    None => Row::decode(&raw, &columns),
+                })
+                .collect();
+            // ORDER BY on projected rows
+            if let Some(ref order) = parsed.order_by {
+                return execute_with_order_and_project(raw_rows, order, parsed.limit, &parsed.select_cols, &columns, &proj);
+            }
+            // LIMIT without ORDER BY
+            let mut result = raw_rows;
+            if let Some(limit) = parsed.limit {
+                result.truncate(limit);
+            }
+            let (result_columns, result) = if proj.is_some() {
+                project_from_projected(&parsed.select_cols, &columns, result, parsed.order_by.as_ref())
+            } else {
+                project_columns(&parsed.select_cols, &columns, result, None, &parsed.from_table)
+            };
+            return Some(LocalResult { columns: result_columns, rows: result });
         } else {
             // Try secondary index: find the first Eq condition for index lookup
             let mut index_pks: Option<Vec<Vec<u8>>> = None;
             for cond in resolved_conds.iter() {
                 if matches!(cond.op, CmpOp::Eq) && cond.literals.len() == 1 {
-                    // Build/refresh the secondary index if needed
                     get_or_build_index(table, &mirror, &columns);
                     if let Some(pks) = index_lookup_eq(table, &mirror, cond.col_idx, &cond.literals[0]) {
                         index_pks = Some(pks);
@@ -1081,27 +1389,79 @@ fn execute_simple(
                 }
             }
 
+            // ── Range index acceleration ──────────────────────────────────
+            // If no Eq index hit, try range index for the first range condition
+            if index_pks.is_none() {
+                for cond in resolved_conds.iter() {
+                    match cond.op {
+                        CmpOp::Gt | CmpOp::Gte | CmpOp::Lt | CmpOp::Lte => {
+                            if cond.literals.len() == 1 {
+                                ensure_range_index(table, &mirror, &columns, cond.col_idx);
+                                if let Some(pks) = index_lookup_range(table, &mirror, cond.col_idx, &cond.op, &cond.literals[0]) {
+                                    index_pks = Some(pks);
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             if let Some(pks) = index_pks {
                 // Index-driven: fetch only matched PKs, then apply remaining conditions
+                // Use projection pushdown for decode
+                let proj = compute_projection_indices(&parsed.select_cols, &columns, parsed.order_by.as_ref());
                 let mut result = Vec::with_capacity(pks.len());
                 for pk in &pks {
                     if let Some(row_ref) = mirror.get(pk) {
                         let raw = row_ref.value();
-                        // Check ALL conditions (including the index one, for safety)
                         if matches_raw(raw, resolved_conds) {
-                            result.push(Row::decode(raw, &columns));
+                            let row = match &proj {
+                                Some(indices) => Row::decode_projected(raw, &columns, indices),
+                                None => Row::decode(raw, &columns),
+                            };
+                            result.push(row);
                         }
                     }
                 }
-                result
+                // Handle ORDER BY + LIMIT on projected results
+                if let Some(ref order) = parsed.order_by {
+                    return execute_with_order_and_project(result, order, parsed.limit, &parsed.select_cols, &columns, &proj);
+                }
+                if let Some(limit) = parsed.limit {
+                    result.truncate(limit);
+                }
+                let (result_columns, result) = if proj.is_some() {
+                    project_from_projected(&parsed.select_cols, &columns, result, parsed.order_by.as_ref())
+                } else {
+                    project_columns(&parsed.select_cols, &columns, result, None, &parsed.from_table)
+                };
+                return Some(LocalResult { columns: result_columns, rows: result });
             } else {
-                // ── Optimization 3: Lazy decode with raw byte filtering ──────
-                // Filter raw bytes first, only decode matching rows
-                mirror
+                // Full scan with raw byte filtering + projection pushdown
+                let proj = compute_projection_indices(&parsed.select_cols, &columns, parsed.order_by.as_ref());
+                let result: Vec<Row> = mirror
                     .iter()
                     .filter(|(_pk, raw)| matches_raw(raw, resolved_conds))
-                    .map(|(_pk, raw)| Row::decode(&raw, &columns))
-                    .collect()
+                    .map(|(_pk, raw)| match &proj {
+                        Some(indices) => Row::decode_projected(&raw, &columns, indices),
+                        None => Row::decode(&raw, &columns),
+                    })
+                    .collect();
+                if let Some(ref order) = parsed.order_by {
+                    return execute_with_order_and_project(result, order, parsed.limit, &parsed.select_cols, &columns, &proj);
+                }
+                let mut result = result;
+                if let Some(limit) = parsed.limit {
+                    result.truncate(limit);
+                }
+                let (result_columns, result) = if proj.is_some() {
+                    project_from_projected(&parsed.select_cols, &columns, result, parsed.order_by.as_ref())
+                } else {
+                    project_columns(&parsed.select_cols, &columns, result, None, &parsed.from_table)
+                };
+                return Some(LocalResult { columns: result_columns, rows: result });
             }
         }
     } else {
@@ -1113,26 +1473,44 @@ fn execute_simple(
             .collect()
     };
 
-    // ORDER BY
+    // ORDER BY (fallback path -- only reached from the else branch above)
     if let Some(ref order) = parsed.order_by {
         if let Some(col_idx) = find_column_idx(&order.column, &columns) {
             let desc = order.descending;
-            rows.sort_by(|a, b| {
-                let cmp = a.values[col_idx]
-                    .partial_cmp(&b.values[col_idx])
-                    .unwrap_or(std::cmp::Ordering::Equal);
-                if desc {
-                    cmp.reverse()
-                } else {
-                    cmp
+            // Use partial sort (select_nth_unstable) when LIMIT is present
+            if let Some(limit) = parsed.limit {
+                if limit < rows.len() {
+                    rows.select_nth_unstable_by(limit, |a, b| {
+                        let cmp = a.values[col_idx]
+                            .partial_cmp(&b.values[col_idx])
+                            .unwrap_or(std::cmp::Ordering::Equal);
+                        if desc { cmp.reverse() } else { cmp }
+                    });
+                    rows.truncate(limit);
                 }
-            });
+                // Sort the final LIMIT rows
+                rows.sort_by(|a, b| {
+                    let cmp = a.values[col_idx]
+                        .partial_cmp(&b.values[col_idx])
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if desc { cmp.reverse() } else { cmp }
+                });
+            } else {
+                rows.sort_by(|a, b| {
+                    let cmp = a.values[col_idx]
+                        .partial_cmp(&b.values[col_idx])
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if desc { cmp.reverse() } else { cmp }
+                });
+            }
         }
     }
 
-    // LIMIT
-    if let Some(limit) = parsed.limit {
-        rows.truncate(limit);
+    // LIMIT (for non-ORDER BY paths)
+    if parsed.order_by.is_none() {
+        if let Some(limit) = parsed.limit {
+            rows.truncate(limit);
+        }
     }
 
     // Project columns
@@ -1142,6 +1520,104 @@ fn execute_simple(
         columns: result_columns,
         rows,
     })
+}
+
+/// Handle ORDER BY + optional LIMIT on already-projected rows, then final column projection.
+fn execute_with_order_and_project(
+    mut rows: Vec<Row>,
+    order: &OrderBy,
+    limit: Option<usize>,
+    select_cols: &[SelectCol],
+    columns: &[ColumnInfo],
+    proj: &Option<Vec<usize>>,
+) -> Option<LocalResult> {
+    // Find the ORDER BY column index in the projected row
+    let order_col_idx = if let Some(ref indices) = proj {
+        // In projected rows, find which position the ORDER BY column maps to
+        let original_idx = find_column_idx(&order.column, columns)?;
+        indices.iter().position(|&i| i == original_idx)?
+    } else {
+        find_column_idx(&order.column, columns)?
+    };
+
+    let desc = order.descending;
+
+    // Use partial sort when LIMIT is present and smaller than total rows
+    if let Some(limit) = limit {
+        if limit < rows.len() {
+            rows.select_nth_unstable_by(limit, |a, b| {
+                let cmp = a.values[order_col_idx]
+                    .partial_cmp(&b.values[order_col_idx])
+                    .unwrap_or(std::cmp::Ordering::Equal);
+                if desc { cmp.reverse() } else { cmp }
+            });
+            rows.truncate(limit);
+        }
+    }
+    // Sort the (potentially truncated) result
+    rows.sort_by(|a, b| {
+        let cmp = a.values[order_col_idx]
+            .partial_cmp(&b.values[order_col_idx])
+            .unwrap_or(std::cmp::Ordering::Equal);
+        if desc { cmp.reverse() } else { cmp }
+    });
+
+    // Final projection: remove ORDER BY column if it was added only for sorting
+    let (result_columns, rows) = if proj.is_some() {
+        project_from_projected(select_cols, columns, rows, Some(order))
+    } else {
+        let table_ref = TableRef { name: String::new(), alias: None };
+        project_columns(select_cols, columns, rows, None, &table_ref)
+    };
+
+    Some(LocalResult { columns: result_columns, rows })
+}
+
+/// Project columns from an already-projected row.
+/// The input rows have values at positions matching `compute_projection_indices` output.
+/// We need to map SELECT column names to their positions in the projected row.
+fn project_from_projected(
+    select_cols: &[SelectCol],
+    columns: &[ColumnInfo],
+    rows: Vec<Row>,
+    order_by: Option<&OrderBy>,
+) -> (Vec<ColumnInfo>, Vec<Row>) {
+    if select_cols.len() == 1 && select_cols[0].name == "*" {
+        return (columns.to_vec(), rows);
+    }
+
+    // Reconstruct the projection indices to know the mapping
+    let proj_indices = compute_projection_indices(select_cols, columns, order_by)
+        .unwrap_or_else(|| (0..columns.len()).collect());
+
+    // For each SELECT column, find its position in the projected row
+    let mut out_indices = Vec::new();
+    let mut result_cols = Vec::new();
+
+    for sc in select_cols {
+        if let Some(orig_idx) = find_column_idx(&sc.name, columns) {
+            if let Some(proj_pos) = proj_indices.iter().position(|&i| i == orig_idx) {
+                out_indices.push(proj_pos);
+                result_cols.push(columns[orig_idx].clone());
+            }
+        }
+    }
+
+    let projected_rows = rows
+        .into_iter()
+        .map(|row| {
+            let values = out_indices.iter().map(|&i| {
+                if i < row.values.len() {
+                    row.values[i].clone()
+                } else {
+                    Value::Null
+                }
+            }).collect();
+            Row { values }
+        })
+        .collect();
+
+    (result_cols, projected_rows)
 }
 
 
