@@ -1412,7 +1412,10 @@ fn execute_simple(
                 // Index-driven: fetch only matched PKs, then apply remaining conditions
                 // Use projection pushdown for decode
                 let proj = compute_projection_indices(&parsed.select_cols, &columns, parsed.order_by.as_ref());
-                let mut result = Vec::with_capacity(pks.len());
+                // Early LIMIT: if no ORDER BY, stop collecting after LIMIT rows
+                let early_limit = if parsed.order_by.is_none() { parsed.limit } else { None };
+                let cap = early_limit.unwrap_or(pks.len()).min(pks.len());
+                let mut result = Vec::with_capacity(cap);
                 for pk in &pks {
                     if let Some(row_ref) = mirror.get(pk) {
                         let raw = row_ref.value();
@@ -1422,6 +1425,9 @@ fn execute_simple(
                                 None => Row::decode(raw, &columns),
                             };
                             result.push(row);
+                            if let Some(lim) = early_limit {
+                                if result.len() >= lim { break; }
+                            }
                         }
                     }
                 }
@@ -1439,16 +1445,22 @@ fn execute_simple(
                 };
                 return Some(LocalResult { columns: result_columns, rows: result });
             } else {
-                // Full scan with raw byte filtering + projection pushdown
+                // Full scan with raw byte filtering + projection pushdown + early LIMIT
                 let proj = compute_projection_indices(&parsed.select_cols, &columns, parsed.order_by.as_ref());
-                let result: Vec<Row> = mirror
-                    .iter()
-                    .filter(|(_pk, raw)| matches_raw(raw, resolved_conds))
-                    .map(|(_pk, raw)| match &proj {
-                        Some(indices) => Row::decode_projected(&raw, &columns, indices),
-                        None => Row::decode(&raw, &columns),
-                    })
-                    .collect();
+                let early_limit = if parsed.order_by.is_none() { parsed.limit } else { None };
+                let mut result: Vec<Row> = Vec::new();
+                for (_pk, raw) in mirror.iter() {
+                    if matches_raw(&raw, resolved_conds) {
+                        let row = match &proj {
+                            Some(indices) => Row::decode_projected(&raw, &columns, indices),
+                            None => Row::decode(&raw, &columns),
+                        };
+                        result.push(row);
+                        if let Some(lim) = early_limit {
+                            if result.len() >= lim { break; }
+                        }
+                    }
+                }
                 if let Some(ref order) = parsed.order_by {
                     return execute_with_order_and_project(result, order, parsed.limit, &parsed.select_cols, &columns, &proj);
                 }
