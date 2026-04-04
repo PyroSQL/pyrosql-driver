@@ -440,8 +440,9 @@ impl PyroConnection {
 pub struct SqlQueryResult {
     /// Column metadata for the result set.
     pub columns: Vec<ColumnInfo>,
-    /// Decoded rows.
-    pub rows: Vec<Row>,
+    /// Decoded rows. Stored as `Arc<Row>` to allow zero-copy sharing
+    /// of pre-decoded rows from the index cache.
+    pub rows: Vec<Arc<Row>>,
 }
 
 impl SqlQueryResult {

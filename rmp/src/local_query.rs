@@ -21,7 +21,7 @@
 
 use crate::mirror::TableMirror;
 use crate::protocol::{ColumnInfo, ColumnType};
-use crate::row::{encode_row, raw_field_decode, raw_field_eq, raw_field_offset, Row, Value};
+use crate::row::{encode_row, raw_field_decode, raw_field_eq, Row, Value};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap};
@@ -79,10 +79,10 @@ fn type_tag_ord(v: &Value) -> u8 {
     }
 }
 
-/// Global query pattern cache: SQL string → parsed SELECT.
-/// Avoids re-parsing the same SQL pattern on every call.
-fn query_cache() -> &'static RwLock<HashMap<String, Option<ParsedSelect>>> {
-    static CACHE: std::sync::OnceLock<RwLock<HashMap<String, Option<ParsedSelect>>>> =
+/// Global query pattern cache: SQL string → parsed SELECT (shared via Arc).
+/// Avoids re-parsing AND re-allocating the same parsed query on every call.
+fn query_cache() -> &'static RwLock<HashMap<String, Option<Arc<ParsedSelect>>>> {
+    static CACHE: std::sync::OnceLock<RwLock<HashMap<String, Option<Arc<ParsedSelect>>>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(256)))
 }
@@ -103,6 +103,10 @@ pub struct MirrorIndex {
     /// Sorted indexes: col_idx → Vec<(OrderableValue, pk_bytes)> sorted by value.
     /// Built lazily on first ORDER BY query against a column.
     sorted_indexes: HashMap<usize, Vec<(OrderableValue, Vec<u8>)>>,
+    /// Pre-decoded rows keyed by PK bytes — avoids Row::decode() on bulk reads.
+    /// Populated during build() so that index-driven queries can return rows
+    /// without touching raw bytes at all.
+    decoded_rows: HashMap<Vec<u8>, Arc<Row>>,
     /// The mirror version at the time this index was built.
     version: u64,
     /// The mirror row count at the time this index was built.
@@ -111,9 +115,14 @@ pub struct MirrorIndex {
 
 impl MirrorIndex {
     /// Build a secondary index from all rows in a mirror.
+    ///
+    /// Also pre-decodes every row and stores it as `Arc<Row>` so that
+    /// index-driven bulk queries can skip `Row::decode()` entirely.
     fn build(mirror: &TableMirror, columns: &[ColumnInfo]) -> Self {
         let mut by_column: HashMap<(usize, Vec<u8>), Vec<Vec<u8>>> =
             HashMap::with_capacity(columns.len() * mirror.len());
+        let mut decoded_rows: HashMap<Vec<u8>, Arc<Row>> =
+            HashMap::with_capacity(mirror.len());
         let version = mirror.version();
         let row_count = mirror.len();
 
@@ -125,10 +134,14 @@ impl MirrorIndex {
                     .or_default()
                     .push(pk.clone());
             }
+            // Pre-decode and cache the row for zero-decode bulk reads
+            let row = Row::decode(&raw, columns);
+            decoded_rows.insert(pk, Arc::new(row));
         }
 
         Self {
             by_column,
+            decoded_rows,
             range_indexes: HashMap::new(),
             sorted_indexes: HashMap::new(),
             version,
@@ -191,31 +204,60 @@ impl MirrorIndex {
 
     /// Get range query results for a column with a comparison operator.
     /// Returns PK bytes for matching rows, or None if range index not available.
+    /// When `limit` is `Some(n)`, stops after collecting `n` PKs (early exit).
     fn range_lookup(
         &self,
         col_idx: usize,
         op: &CmpOp,
         literal: &Value,
+        limit: Option<usize>,
     ) -> Option<Vec<Vec<u8>>> {
         let btree = self.range_indexes.get(&col_idx)?;
         let key = OrderableValue(literal.clone());
+
+        // Helper: collect PKs from an iterator with optional early limit
+        fn collect_limited<'a, I>(iter: I, limit: Option<usize>) -> Vec<Vec<u8>>
+        where
+            I: Iterator<Item = &'a Vec<Vec<u8>>>,
+        {
+            match limit {
+                Some(n) => {
+                    let mut result = Vec::with_capacity(n);
+                    for pk_list in iter {
+                        for pk in pk_list {
+                            result.push(pk.clone());
+                            if result.len() >= n {
+                                return result;
+                            }
+                        }
+                    }
+                    result
+                }
+                None => iter.flat_map(|pks| pks.iter().cloned()).collect(),
+            }
+        }
+
         let pks: Vec<Vec<u8>> = match op {
-            CmpOp::Gt => btree
-                .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
-                .flat_map(|(_, pks)| pks.iter().cloned())
-                .collect(),
-            CmpOp::Gte => btree
-                .range((std::ops::Bound::Included(key), std::ops::Bound::Unbounded))
-                .flat_map(|(_, pks)| pks.iter().cloned())
-                .collect(),
-            CmpOp::Lt => btree
-                .range((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(key)))
-                .flat_map(|(_, pks)| pks.iter().cloned())
-                .collect(),
-            CmpOp::Lte => btree
-                .range((std::ops::Bound::Unbounded, std::ops::Bound::Included(key)))
-                .flat_map(|(_, pks)| pks.iter().cloned())
-                .collect(),
+            CmpOp::Gt => collect_limited(
+                btree.range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+                    .map(|(_, pks)| pks),
+                limit,
+            ),
+            CmpOp::Gte => collect_limited(
+                btree.range((std::ops::Bound::Included(key), std::ops::Bound::Unbounded))
+                    .map(|(_, pks)| pks),
+                limit,
+            ),
+            CmpOp::Lt => collect_limited(
+                btree.range((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(key)))
+                    .map(|(_, pks)| pks),
+                limit,
+            ),
+            CmpOp::Lte => collect_limited(
+                btree.range((std::ops::Bound::Unbounded, std::ops::Bound::Included(key)))
+                    .map(|(_, pks)| pks),
+                limit,
+            ),
             _ => return None,
         };
         Some(pks)
@@ -311,17 +353,19 @@ fn ensure_range_index(
 }
 
 /// Look up PKs matching a range condition via the range index.
+/// When `limit` is `Some(n)`, the BTreeMap scan stops after `n` PKs.
 fn index_lookup_range(
     table: &str,
     mirror: &TableMirror,
     col_idx: usize,
     op: &CmpOp,
     literal: &Value,
+    limit: Option<usize>,
 ) -> Option<Vec<Vec<u8>>> {
     let key = (table.to_string(), mirror.instance_id());
     let cache = index_cache().read();
     let idx = cache.get(&key)?;
-    idx.range_lookup(col_idx, op, literal)
+    idx.range_lookup(col_idx, op, literal, limit)
 }
 
 /// Ensure the sorted index exists for a specific column, building it lazily if needed.
@@ -367,8 +411,15 @@ fn index_lookup_sorted(
 pub struct LocalResult {
     /// Column metadata for the result set.
     pub columns: Vec<ColumnInfo>,
-    /// Decoded rows matching the query.
-    pub rows: Vec<Row>,
+    /// Decoded rows matching the query. Stored as `Arc<Row>` to allow
+    /// zero-copy sharing of pre-decoded rows from the index cache.
+    pub rows: Vec<Arc<Row>>,
+}
+
+/// Wrap a `Vec<Row>` into `Vec<Arc<Row>>` for LocalResult construction.
+#[inline]
+fn wrap_rows(rows: Vec<Row>) -> Vec<Arc<Row>> {
+    rows.into_iter().map(Arc::new).collect()
 }
 
 // ── SQL parser (regex-free, simple string matching) ─────────────────────────
@@ -1127,33 +1178,150 @@ pub fn try_execute_local(
     mirrors: &DashMap<String, Arc<TableMirror>>,
     schemas: &DashMap<String, Vec<ColumnInfo>>,
 ) -> Option<LocalResult> {
+    // ── Hot plan cache: skip parse + resolve entirely for repeated queries ──
+    // Caches the full execution plan (table, column index, literal Value) so
+    // repeated identical queries do zero allocation before hitting the index.
+    {
+        let plan_cache = hot_plan_cache().read();
+        if let Some(plan) = plan_cache.get(sql) {
+            match plan {
+                HotPlan::EqSelectAll { table, col_idx, literal, limit, result_columns } => {
+                    let mirror = mirrors.get(table.as_str())?;
+                    // Avoid String allocation: construct idx_key by borrowing
+                    let inst_id = mirror.instance_id();
+                    let idx_cache = index_cache().read();
+                    // Search by constructing the key inline to avoid table.clone()
+                    let idx_key = (table.clone(), inst_id);
+                    if let Some(idx) = idx_cache.get(&idx_key) {
+                        if idx.version == mirror.version() && idx.row_count == mirror.len() {
+                            if let Some(pks) = idx.lookup(*col_idx, literal) {
+                                let lim = limit.unwrap_or(pks.len()).min(pks.len());
+                                let mut result: Vec<Arc<Row>> = Vec::with_capacity(lim);
+                                for pk in pks {
+                                    if let Some(cached_row) = idx.decoded_rows.get(pk) {
+                                        result.push(Arc::clone(cached_row));
+                                        if result.len() >= lim { break; }
+                                    } else if let Some(row_ref) = mirror.get(pk) {
+                                        result.push(Arc::new(Row::decode(row_ref.value(), result_columns)));
+                                        if result.len() >= lim { break; }
+                                    }
+                                }
+                                return Some(LocalResult {
+                                    columns: result_columns.clone(),
+                                    rows: result,
+                                });
+                            }
+                        }
+                    }
+                    // Index stale or missing — fall through to normal path
+                }
+                HotPlan::RangeSelectAllLimit { table, col_idx, op, literal, limit, result_columns } => {
+                    let mirror = mirrors.get(table.as_str())?;
+                    let inst_id = mirror.instance_id();
+                    let idx_cache = index_cache().read();
+                    let idx_key = (table.clone(), inst_id);
+                    if let Some(idx) = idx_cache.get(&idx_key) {
+                        if idx.version == mirror.version() && idx.row_count == mirror.len() {
+                            if let Some(btree) = idx.range_indexes.get(col_idx) {
+                                let key = OrderableValue(literal.clone());
+                                let mut result: Vec<Arc<Row>> = Vec::with_capacity(*limit);
+                                macro_rules! collect_hot {
+                                    ($iter:expr) => {
+                                        for (_, pk_list) in $iter {
+                                            for pk in pk_list {
+                                                if let Some(cached_row) = idx.decoded_rows.get(pk) {
+                                                    result.push(Arc::clone(cached_row));
+                                                } else if let Some(row_ref) = mirror.get(pk) {
+                                                    result.push(Arc::new(Row::decode(row_ref.value(), result_columns)));
+                                                }
+                                                if result.len() >= *limit { break; }
+                                            }
+                                            if result.len() >= *limit { break; }
+                                        }
+                                    };
+                                }
+                                match op {
+                                    CmpOp::Gt => collect_hot!(btree.range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))),
+                                    CmpOp::Gte => collect_hot!(btree.range((std::ops::Bound::Included(key), std::ops::Bound::Unbounded))),
+                                    CmpOp::Lt => collect_hot!(btree.range((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(key)))),
+                                    CmpOp::Lte => collect_hot!(btree.range((std::ops::Bound::Unbounded, std::ops::Bound::Included(key)))),
+                                    _ => {}
+                                }
+                                if !result.is_empty() {
+                                    return Some(LocalResult {
+                                        columns: result_columns.clone(),
+                                        rows: result,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                HotPlan::Unsupported => return None,
+            }
+        }
+    }
+
     // Query pattern cache: avoid re-parsing identical SQL strings.
-    let parsed = {
+    // Uses Arc<ParsedSelect> so cache hits are just pointer copies (no String allocations).
+    let parsed: Arc<ParsedSelect> = {
         // Fast path: read lock for cache hit
         {
             let cache = query_cache().read();
             if let Some(cached) = cache.get(sql) {
-                match cached.clone() {
-                    Some(p) => return if p.join.is_some() {
-                        execute_join(&p, mirrors, schemas)
-                    } else {
-                        execute_simple(&p, mirrors, schemas)
-                    },
-                    None => return None,
+                match cached {
+                    Some(p) => {
+                        let p = Arc::clone(p);
+                        drop(cache);
+                        // Build hot plan on first query_cache hit only (hot_plan_cache misses above)
+                        {
+                            let plan_cache = hot_plan_cache().read();
+                            if !plan_cache.contains_key(sql) {
+                                drop(plan_cache);
+                                try_build_hot_plan(sql, &p, mirrors, schemas);
+                            }
+                        }
+                        return if p.join.is_some() {
+                            execute_join(&p, mirrors, schemas)
+                        } else {
+                            execute_simple(&p, mirrors, schemas)
+                        };
+                    }
+                    None => {
+                        drop(cache);
+                        // Cache negative result in hot plan too
+                        let mut plan_cache = hot_plan_cache().write();
+                        if plan_cache.len() < 4096 {
+                            plan_cache.insert(sql.to_string(), HotPlan::Unsupported);
+                        }
+                        return None;
+                    }
                 }
             }
         }
         // Slow path: parse and cache with write lock
         let result = parse_select(sql).or_else(|| parse_find(sql));
+        let arc_result = result.map(Arc::new);
+        let ret = arc_result.clone();
         {
             let mut cache = query_cache().write();
             if cache.len() < 4096 {
-                cache.insert(sql.to_string(), result.clone());
+                cache.insert(sql.to_string(), arc_result);
             }
         }
-        match result {
-            Some(p) => p,
-            None => return None,
+        match ret {
+            Some(p) => {
+                // Try to build a hot plan for future calls
+                try_build_hot_plan(sql, &p, mirrors, schemas);
+                p
+            }
+            None => {
+                let mut plan_cache = hot_plan_cache().write();
+                if plan_cache.len() < 4096 {
+                    plan_cache.insert(sql.to_string(), HotPlan::Unsupported);
+                }
+                return None;
+            }
         }
     };
 
@@ -1161,6 +1329,113 @@ pub fn try_execute_local(
         execute_join(&parsed, mirrors, schemas)
     } else {
         execute_simple(&parsed, mirrors, schemas)
+    }
+}
+
+/// Pre-computed execution plan for hot queries.
+/// Avoids re-parsing, re-resolving conditions, and re-allocating per query.
+#[derive(Clone)]
+enum HotPlan {
+    /// SELECT * FROM table WHERE col = literal [LIMIT n]
+    EqSelectAll {
+        table: String,
+        col_idx: usize,
+        literal: Value,
+        limit: Option<usize>,
+        /// Pre-computed columns for the result set.
+        result_columns: Vec<ColumnInfo>,
+    },
+    /// SELECT * FROM table WHERE col {>|>=|<|<=} literal LIMIT n
+    RangeSelectAllLimit {
+        table: String,
+        col_idx: usize,
+        op: CmpOp,
+        literal: Value,
+        limit: usize,
+        /// Pre-computed columns for the result set.
+        result_columns: Vec<ColumnInfo>,
+    },
+    /// Query that should delegate to server.
+    Unsupported,
+}
+
+/// Global hot plan cache.
+fn hot_plan_cache() -> &'static RwLock<HashMap<String, HotPlan>> {
+    static CACHE: std::sync::OnceLock<RwLock<HashMap<String, HotPlan>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(256)))
+}
+
+/// Try to create a HotPlan from a parsed query. Only creates plans for
+/// patterns that benefit from the fast path.
+fn try_build_hot_plan(
+    sql: &str,
+    parsed: &ParsedSelect,
+    mirrors: &DashMap<String, Arc<TableMirror>>,
+    schemas: &DashMap<String, Vec<ColumnInfo>>,
+) {
+    // Only for simple single-table queries
+    if parsed.join.is_some() { return; }
+
+    let table = &parsed.from_table.name;
+    let columns = match schemas.get(table) { Some(c) => c.value().clone(), None => return };
+
+    // Check SELECT *
+    let is_select_all = parsed.select_cols.len() == 1 && parsed.select_cols[0].name == "*";
+    if !is_select_all { return; }
+    if parsed.order_by.is_some() { return; }
+    if parsed.where_conds.len() != 1 { return; }
+
+    let cond = &parsed.where_conds[0];
+    if cond.values.len() != 1 { return; }
+
+    let col_idx = match find_column_idx(&cond.column, &columns) {
+        Some(i) => i,
+        None => return,
+    };
+    let col_type = columns[col_idx].type_tag;
+    let literal = match Value::parse_literal(&cond.values[0], col_type) {
+        Some(v) => v,
+        None => return,
+    };
+
+    // Ensure index is built
+    if let Some(mirror) = mirrors.get(table) {
+        get_or_build_index(table, &mirror, &columns);
+    }
+
+    let plan = match cond.op {
+        CmpOp::Eq => HotPlan::EqSelectAll {
+            table: table.clone(),
+            col_idx,
+            literal,
+            limit: parsed.limit,
+            result_columns: columns.clone(),
+        },
+        CmpOp::Gt | CmpOp::Gte | CmpOp::Lt | CmpOp::Lte => {
+            if let Some(limit) = parsed.limit {
+                // Ensure range index
+                if let Some(mirror) = mirrors.get(table) {
+                    ensure_range_index(table, &mirror, &columns, col_idx);
+                }
+                HotPlan::RangeSelectAllLimit {
+                    table: table.clone(),
+                    col_idx,
+                    op: cond.op.clone(),
+                    literal,
+                    limit,
+                    result_columns: columns.clone(),
+                }
+            } else {
+                return;
+            }
+        }
+        _ => return,
+    };
+
+    let mut plan_cache = hot_plan_cache().write();
+    if plan_cache.len() < 4096 {
+        plan_cache.insert(sql.to_string(), plan);
     }
 }
 
@@ -1342,7 +1617,7 @@ fn execute_simple(
                         } else {
                             project_columns(&parsed.select_cols, &columns, rows, None, &parsed.from_table)
                         };
-                        return Some(LocalResult { columns: result_columns, rows });
+                        return Some(LocalResult { columns: result_columns, rows: wrap_rows(rows) });
                     }
                 }
             }
@@ -1375,8 +1650,124 @@ fn execute_simple(
             } else {
                 project_columns(&parsed.select_cols, &columns, result, None, &parsed.from_table)
             };
-            return Some(LocalResult { columns: result_columns, rows: result });
+            return Some(LocalResult { columns: result_columns, rows: wrap_rows(result) });
         } else {
+            // ── Ultra-fast path: single Eq condition + SELECT * + no ORDER BY ──
+            // Holds one read lock on the index cache and collects Arc<Row> pointers
+            // directly — zero allocation per row, zero DashMap lookups.
+            let proj = compute_projection_indices(&parsed.select_cols, &columns, parsed.order_by.as_ref());
+            let is_simple_eq = resolved_conds.len() == 1
+                && matches!(resolved_conds[0].op, CmpOp::Eq)
+                && resolved_conds[0].literals.len() == 1
+                && proj.is_none()
+                && parsed.order_by.is_none();
+
+            if is_simple_eq {
+                // Single lock acquisition: check freshness + lookup + collect, all under one read lock.
+                let idx_key = (table.to_string(), mirror.instance_id());
+                let needs_build = {
+                    let cache = index_cache().read();
+                    match cache.get(&idx_key) {
+                        Some(idx) if idx.version == mirror.version() && idx.row_count == mirror.len() => {
+                            // Index is fresh — try the fast path directly under this lock
+                            let cond = &resolved_conds[0];
+                            if let Some(pks) = idx.lookup(cond.col_idx, &cond.literals[0]) {
+                                let limit = parsed.limit.unwrap_or(pks.len()).min(pks.len());
+                                let mut arc_result: Vec<Arc<Row>> = Vec::with_capacity(limit);
+                                for pk in pks {
+                                    if let Some(cached_row) = idx.decoded_rows.get(pk) {
+                                        arc_result.push(Arc::clone(cached_row));
+                                        if arc_result.len() >= limit { break; }
+                                    } else if let Some(row_ref) = mirror.get(pk) {
+                                        arc_result.push(Arc::new(Row::decode(row_ref.value(), &columns)));
+                                        if arc_result.len() >= limit { break; }
+                                    }
+                                }
+                                return Some(LocalResult { columns: columns.clone(), rows: arc_result });
+                            }
+                            false // index fresh but lookup missed — fall through
+                        }
+                        _ => true, // needs build
+                    }
+                };
+                if needs_build {
+                    get_or_build_index(table, &mirror, &columns);
+                    // Retry under fresh lock
+                    let cache = index_cache().read();
+                    if let Some(idx) = cache.get(&idx_key) {
+                        let cond = &resolved_conds[0];
+                        if let Some(pks) = idx.lookup(cond.col_idx, &cond.literals[0]) {
+                            let limit = parsed.limit.unwrap_or(pks.len()).min(pks.len());
+                            let mut arc_result: Vec<Arc<Row>> = Vec::with_capacity(limit);
+                            for pk in pks {
+                                if let Some(cached_row) = idx.decoded_rows.get(pk) {
+                                    arc_result.push(Arc::clone(cached_row));
+                                    if arc_result.len() >= limit { break; }
+                                } else if let Some(row_ref) = mirror.get(pk) {
+                                    arc_result.push(Arc::new(Row::decode(row_ref.value(), &columns)));
+                                    if arc_result.len() >= limit { break; }
+                                }
+                            }
+                            return Some(LocalResult { columns: columns.clone(), rows: arc_result });
+                        }
+                    }
+                }
+                // Fall through to normal path if index lookup failed
+            }
+
+            // ── Ultra-fast range path: single range + LIMIT + SELECT * ──
+            // Similar to the Eq ultra-fast path: hold one lock, iterate BTreeMap
+            // range directly, collect Arc<Row> from decoded cache, stop at LIMIT.
+            let is_simple_range = resolved_conds.len() == 1
+                && matches!(resolved_conds[0].op, CmpOp::Gt | CmpOp::Gte | CmpOp::Lt | CmpOp::Lte)
+                && resolved_conds[0].literals.len() == 1
+                && proj.is_none()
+                && parsed.order_by.is_none()
+                && parsed.limit.is_some();
+
+            if is_simple_range {
+                let cond = &resolved_conds[0];
+                ensure_range_index(table, &mirror, &columns, cond.col_idx);
+                let idx_key = (table.to_string(), mirror.instance_id());
+                let idx_cache = index_cache().read();
+                if let Some(idx) = idx_cache.get(&idx_key) {
+                    if let Some(btree) = idx.range_indexes.get(&cond.col_idx) {
+                        let limit = parsed.limit.unwrap();
+                        let key = OrderableValue(cond.literals[0].clone());
+                        let mut arc_result: Vec<Arc<Row>> = Vec::with_capacity(limit);
+
+                        // Iterate the BTreeMap range directly, collecting pre-decoded rows
+                        macro_rules! collect_range {
+                            ($iter:expr) => {
+                                for (_, pk_list) in $iter {
+                                    for pk in pk_list {
+                                        if let Some(cached_row) = idx.decoded_rows.get(pk) {
+                                            arc_result.push(Arc::clone(cached_row));
+                                        } else if let Some(row_ref) = mirror.get(pk) {
+                                            arc_result.push(Arc::new(Row::decode(row_ref.value(), &columns)));
+                                        }
+                                        if arc_result.len() >= limit { break; }
+                                    }
+                                    if arc_result.len() >= limit { break; }
+                                }
+                            };
+                        }
+                        match cond.op {
+                            CmpOp::Gt => collect_range!(btree.range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))),
+                            CmpOp::Gte => collect_range!(btree.range((std::ops::Bound::Included(key), std::ops::Bound::Unbounded))),
+                            CmpOp::Lt => collect_range!(btree.range((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(key)))),
+                            CmpOp::Lte => collect_range!(btree.range((std::ops::Bound::Unbounded, std::ops::Bound::Included(key)))),
+                            _ => unreachable!(),
+                        }
+                        drop(idx_cache);
+                        let result_columns = columns.clone();
+                        return Some(LocalResult { columns: result_columns, rows: arc_result });
+                    }
+                }
+                drop(idx_cache);
+                // Fall through to normal path
+            }
+
             // Try secondary index: find the first Eq condition for index lookup
             let mut index_pks: Option<Vec<Vec<u8>>> = None;
             for cond in resolved_conds.iter() {
@@ -1390,15 +1781,24 @@ fn execute_simple(
             }
 
             // ── Range index acceleration ──────────────────────────────────
-            // If no Eq index hit, try range index for the first range condition
+            // If no Eq index hit, try range index for the first range condition.
+            // When there is a single range condition + LIMIT (no ORDER BY),
+            // pass the limit down so the BTreeMap scan is O(LIMIT) not O(N).
+            let mut _range_used = false;
             if index_pks.is_none() {
                 for cond in resolved_conds.iter() {
                     match cond.op {
                         CmpOp::Gt | CmpOp::Gte | CmpOp::Lt | CmpOp::Lte => {
                             if cond.literals.len() == 1 {
+                                let push_limit = if parsed.order_by.is_none() && resolved_conds.len() == 1 {
+                                    parsed.limit
+                                } else {
+                                    None
+                                };
                                 ensure_range_index(table, &mirror, &columns, cond.col_idx);
-                                if let Some(pks) = index_lookup_range(table, &mirror, cond.col_idx, &cond.op, &cond.literals[0]) {
+                                if let Some(pks) = index_lookup_range(table, &mirror, cond.col_idx, &cond.op, &cond.literals[0], push_limit) {
                                     index_pks = Some(pks);
+                                    _range_used = true;
                                     break;
                                 }
                             }
@@ -1409,14 +1809,91 @@ fn execute_simple(
             }
 
             if let Some(pks) = index_pks {
-                // Index-driven: fetch only matched PKs, then apply remaining conditions
-                // Use projection pushdown for decode
-                let proj = compute_projection_indices(&parsed.select_cols, &columns, parsed.order_by.as_ref());
-                // Early LIMIT: if no ORDER BY, stop collecting after LIMIT rows
+                // Index-driven: fetch only matched PKs with pre-decoded rows.
                 let early_limit = if parsed.order_by.is_none() { parsed.limit } else { None };
                 let cap = early_limit.unwrap_or(pks.len()).min(pks.len());
-                let mut result = Vec::with_capacity(cap);
+
+                let idx_key = (table.to_string(), mirror.instance_id());
+                let idx_cache = index_cache().read();
+                let cached_idx = idx_cache.get(&idx_key);
+                let needs_post_filter = resolved_conds.len() > 1;
+
+                // For SELECT * (no projection, no ORDER BY), collect Arc<Row> directly.
+                if proj.is_none() && parsed.order_by.is_none() {
+                    let mut arc_result: Vec<Arc<Row>> = Vec::with_capacity(cap);
+                    for pk in &pks {
+                        if let Some(idx) = cached_idx {
+                            if let Some(cached_row) = idx.decoded_rows.get(pk) {
+                                if needs_post_filter {
+                                    if let Some(row_ref) = mirror.get(pk) {
+                                        if !matches_raw(row_ref.value(), resolved_conds) {
+                                            continue;
+                                        }
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                arc_result.push(Arc::clone(cached_row));
+                                if let Some(lim) = early_limit {
+                                    if arc_result.len() >= lim { break; }
+                                }
+                                continue;
+                            }
+                        }
+                        if let Some(row_ref) = mirror.get(pk) {
+                            let raw = row_ref.value();
+                            if matches_raw(raw, resolved_conds) {
+                                arc_result.push(Arc::new(Row::decode(raw, &columns)));
+                                if let Some(lim) = early_limit {
+                                    if arc_result.len() >= lim { break; }
+                                }
+                            }
+                        }
+                    }
+                    drop(idx_cache);
+                    if let Some(limit) = parsed.limit {
+                        arc_result.truncate(limit);
+                    }
+                    let (result_columns, arc_result) = project_columns_arc(
+                        &parsed.select_cols, &columns, arc_result, &parsed.from_table,
+                    );
+                    return Some(LocalResult { columns: result_columns, rows: arc_result });
+                }
+
+                // Projection or ORDER BY needed: collect as Vec<Row>, wrap at the end.
+                let mut result: Vec<Row> = Vec::with_capacity(cap);
                 for pk in &pks {
+                    if let Some(idx) = cached_idx {
+                        if let Some(cached_row) = idx.decoded_rows.get(pk) {
+                            if needs_post_filter {
+                                if let Some(row_ref) = mirror.get(pk) {
+                                    if !matches_raw(row_ref.value(), resolved_conds) {
+                                        continue;
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
+                            let row = match &proj {
+                                Some(indices) => {
+                                    let values = indices.iter().map(|&i| {
+                                        if i < cached_row.values.len() {
+                                            cached_row.values[i].clone()
+                                        } else {
+                                            Value::Null
+                                        }
+                                    }).collect();
+                                    Row { values }
+                                }
+                                None => (**cached_row).clone(),
+                            };
+                            result.push(row);
+                            if let Some(lim) = early_limit {
+                                if result.len() >= lim { break; }
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(row_ref) = mirror.get(pk) {
                         let raw = row_ref.value();
                         if matches_raw(raw, resolved_conds) {
@@ -1431,7 +1908,7 @@ fn execute_simple(
                         }
                     }
                 }
-                // Handle ORDER BY + LIMIT on projected results
+                drop(idx_cache);
                 if let Some(ref order) = parsed.order_by {
                     return execute_with_order_and_project(result, order, parsed.limit, &parsed.select_cols, &columns, &proj);
                 }
@@ -1443,7 +1920,7 @@ fn execute_simple(
                 } else {
                     project_columns(&parsed.select_cols, &columns, result, None, &parsed.from_table)
                 };
-                return Some(LocalResult { columns: result_columns, rows: result });
+                return Some(LocalResult { columns: result_columns, rows: wrap_rows(result) });
             } else {
                 // Full scan with raw byte filtering + projection pushdown + early LIMIT
                 let proj = compute_projection_indices(&parsed.select_cols, &columns, parsed.order_by.as_ref());
@@ -1473,7 +1950,7 @@ fn execute_simple(
                 } else {
                     project_columns(&parsed.select_cols, &columns, result, None, &parsed.from_table)
                 };
-                return Some(LocalResult { columns: result_columns, rows: result });
+                return Some(LocalResult { columns: result_columns, rows: wrap_rows(result) });
             }
         }
     } else {
@@ -1530,7 +2007,7 @@ fn execute_simple(
 
     Some(LocalResult {
         columns: result_columns,
-        rows,
+        rows: wrap_rows(rows),
     })
 }
 
@@ -1582,7 +2059,7 @@ fn execute_with_order_and_project(
         project_columns(select_cols, columns, rows, None, &table_ref)
     };
 
-    Some(LocalResult { columns: result_columns, rows })
+    Some(LocalResult { columns: result_columns, rows: wrap_rows(rows) })
 }
 
 /// Project columns from an already-projected row.
@@ -1825,7 +2302,7 @@ fn execute_join(
 
     Some(LocalResult {
         columns: result_columns,
-        rows: result_rows,
+        rows: wrap_rows(result_rows),
     })
 }
 
@@ -2057,6 +2534,40 @@ fn project_columns(
         .map(|row| {
             let values = indices.iter().map(|&i| row.values[i].clone()).collect();
             Row { values }
+        })
+        .collect();
+
+    (result_cols, projected_rows)
+}
+
+/// Project columns for a single-table SELECT, operating on `Arc<Row>`.
+/// For `SELECT *`, returns the Arc<Row> directly (zero-copy).
+/// For column subsets, creates new projected rows wrapped in Arc.
+fn project_columns_arc(
+    select_cols: &[SelectCol],
+    columns: &[ColumnInfo],
+    rows: Vec<Arc<Row>>,
+    _table_ref: &TableRef,
+) -> (Vec<ColumnInfo>, Vec<Arc<Row>>) {
+    if select_cols.len() == 1 && select_cols[0].name == "*" {
+        return (columns.to_vec(), rows);
+    }
+
+    let mut indices = Vec::new();
+    let mut result_cols = Vec::new();
+
+    for sc in select_cols {
+        if let Some(idx) = find_column_idx(&sc.name, columns) {
+            indices.push(idx);
+            result_cols.push(columns[idx].clone());
+        }
+    }
+
+    let projected_rows = rows
+        .into_iter()
+        .map(|row| {
+            let values = indices.iter().map(|&i| row.values[i].clone()).collect();
+            Arc::new(Row { values })
         })
         .collect();
 
