@@ -20,10 +20,131 @@
 //! caller falls back to the server.
 
 use crate::mirror::TableMirror;
-use crate::protocol::ColumnInfo;
-use crate::row::{encode_row, Row, Value};
+use crate::protocol::{ColumnInfo, ColumnType};
+use crate::row::{encode_row, raw_field_decode, raw_field_eq, Row, Value};
 use dashmap::DashMap;
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Global query pattern cache: SQL string → parsed SELECT.
+/// Avoids re-parsing the same SQL pattern on every call.
+fn query_cache() -> &'static RwLock<HashMap<String, Option<ParsedSelect>>> {
+    static CACHE: std::sync::OnceLock<RwLock<HashMap<String, Option<ParsedSelect>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(256)))
+}
+
+/// Secondary index for a single table mirror.
+///
+/// Maps `(column_index, stringified_value)` to a list of PK bytes, enabling
+/// O(1) equality lookups on any column without scanning the full mirror.
+pub struct MirrorIndex {
+    /// Maps (col_idx, value_key) → Vec<pk_bytes>.
+    by_column: HashMap<(usize, Vec<u8>), Vec<Vec<u8>>>,
+    /// The mirror version at the time this index was built.
+    version: u64,
+    /// The mirror row count at the time this index was built.
+    row_count: usize,
+}
+
+impl MirrorIndex {
+    /// Build a secondary index from all rows in a mirror.
+    fn build(mirror: &TableMirror, columns: &[ColumnInfo]) -> Self {
+        let mut by_column: HashMap<(usize, Vec<u8>), Vec<Vec<u8>>> =
+            HashMap::with_capacity(columns.len() * mirror.len());
+        let version = mirror.version();
+        let row_count = mirror.len();
+
+        for (pk, raw) in mirror.iter() {
+            for (i, col) in columns.iter().enumerate() {
+                let key_bytes = Self::extract_field_key(&raw, i, col.type_tag);
+                by_column
+                    .entry((i, key_bytes))
+                    .or_default()
+                    .push(pk.clone());
+            }
+        }
+
+        Self {
+            by_column,
+            version,
+            row_count,
+        }
+    }
+
+    /// Extract the raw key bytes for a field value (used as index key).
+    /// For Int64/Float64/Bool, use the raw encoded bytes.
+    /// For Text/Bytes, use the raw bytes directly.
+    fn extract_field_key(raw: &[u8], col_idx: usize, _type_tag: ColumnType) -> Vec<u8> {
+        match crate::row::raw_field_offset(raw, col_idx) {
+            Some((offset, len)) => raw[offset..offset + len].to_vec(),
+            None => vec![0xFF, 0xFF, 0xFF, 0xFF], // NULL sentinel key
+        }
+    }
+
+    /// Look up all PK bytes matching a column equality condition.
+    fn lookup(&self, col_idx: usize, literal: &Value) -> Option<&Vec<Vec<u8>>> {
+        let key_bytes = Self::value_to_key_bytes(literal);
+        self.by_column.get(&(col_idx, key_bytes))
+    }
+
+    /// Convert a Value to the raw key bytes for index lookup.
+    fn value_to_key_bytes(v: &Value) -> Vec<u8> {
+        match v {
+            Value::Int64(n) => n.to_le_bytes().to_vec(),
+            Value::Float64(f) => f.to_le_bytes().to_vec(),
+            Value::Text(s) => s.as_bytes().to_vec(),
+            Value::Bool(b) => vec![if *b { 1 } else { 0 }],
+            Value::Bytes(b) => b.clone(),
+            Value::Null => vec![0xFF, 0xFF, 0xFF, 0xFF],
+        }
+    }
+}
+
+/// Global secondary index cache: (table_name, instance_id) → MirrorIndex.
+/// Keyed by both table name and mirror instance ID to avoid cross-test pollution.
+fn index_cache() -> &'static RwLock<HashMap<(String, u64), MirrorIndex>> {
+    static CACHE: std::sync::OnceLock<RwLock<HashMap<(String, u64), MirrorIndex>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Get or rebuild the secondary index for a table.
+fn get_or_build_index(
+    table: &str,
+    mirror: &TableMirror,
+    columns: &[ColumnInfo],
+) {
+    let key = (table.to_string(), mirror.instance_id());
+    // Fast check with read lock
+    {
+        let cache = index_cache().read();
+        if let Some(idx) = cache.get(&key) {
+            if idx.version == mirror.version() && idx.row_count == mirror.len() {
+                return;
+            }
+        }
+    }
+    // Rebuild with write lock
+    let idx = MirrorIndex::build(mirror, columns);
+    let mut cache = index_cache().write();
+    cache.insert(key, idx);
+}
+
+/// Try to use the secondary index for a single equality condition.
+/// Returns the list of PK bytes if the index can serve this query.
+fn index_lookup_eq(
+    table: &str,
+    mirror: &TableMirror,
+    col_idx: usize,
+    literal: &Value,
+) -> Option<Vec<Vec<u8>>> {
+    let key = (table.to_string(), mirror.instance_id());
+    let cache = index_cache().read();
+    let idx = cache.get(&key)?;
+    idx.lookup(col_idx, literal).cloned()
+}
 
 /// Result of a locally-executed query.
 pub struct LocalResult {
@@ -36,7 +157,7 @@ pub struct LocalResult {
 // ── SQL parser (regex-free, simple string matching) ─────────────────────────
 
 /// A parsed SELECT query.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParsedSelect {
     /// Column names to project ("*" means all).
     select_cols: Vec<SelectCol>,
@@ -60,13 +181,13 @@ struct SelectCol {
     name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TableRef {
     name: String,
     alias: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct JoinClause {
     table: TableRef,
     /// Left side of ON: (alias, column).
@@ -75,7 +196,7 @@ struct JoinClause {
     right: (String, String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CmpOp {
     Eq,
     Gt,
@@ -86,7 +207,7 @@ enum CmpOp {
     In,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Condition {
     /// Optional table alias.
     table_alias: Option<String>,
@@ -96,7 +217,7 @@ struct Condition {
     values: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct OrderBy {
     table_alias: Option<String>,
     column: String,
@@ -305,19 +426,6 @@ fn parse_condition(s: &str) -> Option<Condition> {
     None
 }
 
-impl Clone for CmpOp {
-    fn clone(&self) -> Self {
-        match self {
-            CmpOp::Eq => CmpOp::Eq,
-            CmpOp::Gt => CmpOp::Gt,
-            CmpOp::Lt => CmpOp::Lt,
-            CmpOp::Gte => CmpOp::Gte,
-            CmpOp::Lte => CmpOp::Lte,
-            CmpOp::Ne => CmpOp::Ne,
-            CmpOp::In => CmpOp::In,
-        }
-    }
-}
 
 /// Find a keyword position in the upper-cased SQL, respecting word boundaries.
 fn find_keyword(upper: &str, kw: &str) -> Option<usize> {
@@ -802,14 +910,139 @@ pub fn try_execute_local(
     mirrors: &DashMap<String, Arc<TableMirror>>,
     schemas: &DashMap<String, Vec<ColumnInfo>>,
 ) -> Option<LocalResult> {
-    // Try SELECT first, then FIND (PyroSQL native syntax)
-    let parsed = parse_select(sql).or_else(|| parse_find(sql))?;
+    // Query pattern cache: avoid re-parsing identical SQL strings.
+    let parsed = {
+        // Fast path: read lock for cache hit
+        {
+            let cache = query_cache().read();
+            if let Some(cached) = cache.get(sql) {
+                match cached.clone() {
+                    Some(p) => return if p.join.is_some() {
+                        execute_join(&p, mirrors, schemas)
+                    } else {
+                        execute_simple(&p, mirrors, schemas)
+                    },
+                    None => return None,
+                }
+            }
+        }
+        // Slow path: parse and cache with write lock
+        let result = parse_select(sql).or_else(|| parse_find(sql));
+        {
+            let mut cache = query_cache().write();
+            if cache.len() < 4096 {
+                cache.insert(sql.to_string(), result.clone());
+            }
+        }
+        match result {
+            Some(p) => p,
+            None => return None,
+        }
+    };
 
     if parsed.join.is_some() {
         execute_join(&parsed, mirrors, schemas)
     } else {
         execute_simple(&parsed, mirrors, schemas)
     }
+}
+
+/// Resolve the column indices and pre-parsed literal values for all WHERE conditions.
+/// Returns None if any condition references an unknown column.
+struct ResolvedCondition {
+    col_idx: usize,
+    col_type: ColumnType,
+    op: CmpOp,
+    /// Pre-parsed literal values for comparison.
+    literals: Vec<Value>,
+}
+
+fn resolve_conditions(
+    conditions: &[Condition],
+    columns: &[ColumnInfo],
+    table_ref: &TableRef,
+) -> Option<Vec<ResolvedCondition>> {
+    let mut resolved = Vec::with_capacity(conditions.len());
+    for cond in conditions {
+        if let Some(ref alias) = cond.table_alias {
+            let table_alias = table_ref.alias.as_deref().unwrap_or(&table_ref.name);
+            if alias != table_alias {
+                return None;
+            }
+        }
+        let col_idx = find_column_idx(&cond.column, columns)?;
+        let col_type = columns[col_idx].type_tag;
+        let literals: Vec<Value> = cond
+            .values
+            .iter()
+            .filter_map(|v| Value::parse_literal(v, col_type))
+            .collect();
+        if literals.len() != cond.values.len() {
+            return None; // Couldn't parse all literals
+        }
+        resolved.push(ResolvedCondition {
+            col_idx,
+            col_type,
+            op: cond.op.clone(),
+            literals,
+        });
+    }
+    Some(resolved)
+}
+
+/// Check if a raw row matches all resolved conditions using lazy byte-level comparison.
+/// Only decodes individual fields when needed (for range comparisons).
+fn matches_raw(raw: &[u8], conditions: &[ResolvedCondition]) -> bool {
+    for cond in conditions {
+        match cond.op {
+            CmpOp::Eq => {
+                if cond.literals.len() != 1 {
+                    return false;
+                }
+                if !raw_field_eq(raw, cond.col_idx, &cond.literals[0]) {
+                    return false;
+                }
+            }
+            CmpOp::In => {
+                let mut found = false;
+                for lit in &cond.literals {
+                    if raw_field_eq(raw, cond.col_idx, lit) {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return false;
+                }
+            }
+            // For range ops, decode just the single field
+            ref op => {
+                let val = raw_field_decode(raw, cond.col_idx, cond.col_type);
+                if cond.literals.len() != 1 {
+                    return false;
+                }
+                let lit = &cond.literals[0];
+                let pass = match op {
+                    CmpOp::Ne => &val != lit,
+                    CmpOp::Gt => matches!(val.partial_cmp(lit), Some(std::cmp::Ordering::Greater)),
+                    CmpOp::Lt => matches!(val.partial_cmp(lit), Some(std::cmp::Ordering::Less)),
+                    CmpOp::Gte => matches!(
+                        val.partial_cmp(lit),
+                        Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                    ),
+                    CmpOp::Lte => matches!(
+                        val.partial_cmp(lit),
+                        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                    ),
+                    _ => unreachable!(),
+                };
+                if !pass {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Execute a simple single-table SELECT.
@@ -823,12 +1056,62 @@ fn execute_simple(
     let columns = schemas.get(table)?;
     let columns = columns.value().clone();
 
-    // Decode all rows and apply WHERE
-    let mut rows: Vec<Row> = mirror
-        .iter()
-        .map(|(_pk, raw)| Row::decode(&raw, &columns))
-        .filter(|row| matches_where(row, &parsed.where_conds, &columns, None, &parsed.from_table))
-        .collect();
+    // ── Optimization 1+2: Secondary index for equality conditions ──────
+    // Pre-resolve conditions to avoid repeated string parsing per row.
+    let resolved = resolve_conditions(&parsed.where_conds, &columns, &parsed.from_table);
+
+    let mut rows: Vec<Row> = if let Some(ref resolved_conds) = resolved {
+        if resolved_conds.is_empty() {
+            // No WHERE: decode all rows
+            mirror
+                .iter()
+                .map(|(_pk, raw)| Row::decode(&raw, &columns))
+                .collect()
+        } else {
+            // Try secondary index: find the first Eq condition for index lookup
+            let mut index_pks: Option<Vec<Vec<u8>>> = None;
+            for cond in resolved_conds.iter() {
+                if matches!(cond.op, CmpOp::Eq) && cond.literals.len() == 1 {
+                    // Build/refresh the secondary index if needed
+                    get_or_build_index(table, &mirror, &columns);
+                    if let Some(pks) = index_lookup_eq(table, &mirror, cond.col_idx, &cond.literals[0]) {
+                        index_pks = Some(pks);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(pks) = index_pks {
+                // Index-driven: fetch only matched PKs, then apply remaining conditions
+                let mut result = Vec::with_capacity(pks.len());
+                for pk in &pks {
+                    if let Some(row_ref) = mirror.get(pk) {
+                        let raw = row_ref.value();
+                        // Check ALL conditions (including the index one, for safety)
+                        if matches_raw(raw, resolved_conds) {
+                            result.push(Row::decode(raw, &columns));
+                        }
+                    }
+                }
+                result
+            } else {
+                // ── Optimization 3: Lazy decode with raw byte filtering ──────
+                // Filter raw bytes first, only decode matching rows
+                mirror
+                    .iter()
+                    .filter(|(_pk, raw)| matches_raw(raw, resolved_conds))
+                    .map(|(_pk, raw)| Row::decode(&raw, &columns))
+                    .collect()
+            }
+        }
+    } else {
+        // Fallback: decode all, filter with original method
+        mirror
+            .iter()
+            .map(|(_pk, raw)| Row::decode(&raw, &columns))
+            .filter(|row| matches_where(row, &parsed.where_conds, &columns, None, &parsed.from_table))
+            .collect()
+    };
 
     // ORDER BY
     if let Some(ref order) = parsed.order_by {
@@ -860,6 +1143,7 @@ fn execute_simple(
         rows,
     })
 }
+
 
 /// Execute a 2-table JOIN query.
 fn execute_join(
@@ -908,43 +1192,108 @@ fn execute_join(
         });
     }
 
-    // Decode left rows
-    let left_rows: Vec<Row> = left_mirror
-        .iter()
-        .map(|(_pk, raw)| Row::decode(&raw, &left_cols))
-        .collect();
+    // ── Optimization: Filter left rows before joining ──────────────────
+    // If there are WHERE conditions that apply to the left table only,
+    // filter the left rows first to reduce the join input.
+    let left_resolved = {
+        let left_alias = left_table.alias.as_deref().unwrap_or(&left_table.name);
+        let left_only_conds: Vec<Condition> = parsed
+            .where_conds
+            .iter()
+            .filter(|c| {
+                // Conditions that apply to left table (or have no alias and match a left column)
+                if let Some(ref a) = c.table_alias {
+                    a == left_alias
+                } else {
+                    find_column_idx(&c.column, &left_cols).is_some()
+                        && find_column_idx(&c.column, &right_cols).is_none()
+                }
+            })
+            .cloned()
+            .collect();
+        resolve_conditions(&left_only_conds, &left_cols, left_table)
+    };
 
-    // Decode right rows
-    let right_rows: Vec<Row> = right_mirror
-        .iter()
-        .map(|(_pk, raw)| Row::decode(&raw, &right_cols))
-        .collect();
+    // Use secondary index for left table equality conditions, or scan with lazy decode
+    let left_rows: Vec<Row> = if let Some(ref resolved) = left_resolved {
+        if !resolved.is_empty() {
+            // Try secondary index for an Eq condition on the left table
+            let mut idx_pks: Option<Vec<Vec<u8>>> = None;
+            for cond in resolved.iter() {
+                if matches!(cond.op, CmpOp::Eq) && cond.literals.len() == 1 {
+                    get_or_build_index(&left_table.name, &left_mirror, &left_cols);
+                    if let Some(pks) = index_lookup_eq(&left_table.name, &left_mirror, cond.col_idx, &cond.literals[0]) {
+                        idx_pks = Some(pks);
+                        break;
+                    }
+                }
+            }
+            if let Some(pks) = idx_pks {
+                let mut result = Vec::with_capacity(pks.len());
+                for pk in &pks {
+                    if let Some(row_ref) = left_mirror.get(pk) {
+                        let raw = row_ref.value();
+                        if matches_raw(raw, resolved) {
+                            result.push(Row::decode(raw, &left_cols));
+                        }
+                    }
+                }
+                result
+            } else {
+                // Scan with lazy decode
+                left_mirror
+                    .iter()
+                    .filter(|(_pk, raw)| matches_raw(raw, resolved))
+                    .map(|(_pk, raw)| Row::decode(&raw, &left_cols))
+                    .collect()
+            }
+        } else {
+            left_mirror
+                .iter()
+                .map(|(_pk, raw)| Row::decode(&raw, &left_cols))
+                .collect()
+        }
+    } else {
+        left_mirror
+            .iter()
+            .map(|(_pk, raw)| Row::decode(&raw, &left_cols))
+            .collect()
+    };
 
-    // Nested loop join
+    // ── Hash join: build hash map on right table's join column ──────────
+    // Build secondary index on right table, then use it for lookup
+    get_or_build_index(&right_table.name, &right_mirror, &right_cols);
+
     let mut joined_rows: Vec<Row> = Vec::new();
     for l_row in &left_rows {
         let l_val = &l_row.values[left_join_idx];
-        for r_row in &right_rows {
-            let r_val = &r_row.values[right_join_idx];
-            if l_val == r_val {
-                // Combine row values
-                let mut combined = l_row.values.clone();
-                combined.extend_from_slice(&r_row.values);
-                let combined_row = Row { values: combined };
 
-                // Apply WHERE filter
-                if matches_join_where(
-                    &combined_row,
-                    &parsed.where_conds,
-                    left_table,
-                    right_table,
-                    &left_cols,
-                    &right_cols,
-                ) {
-                    joined_rows.push(combined_row);
+        // Use secondary index to find matching right rows by join column
+        let matching_pks = index_lookup_eq(&right_table.name, &right_mirror, right_join_idx, l_val);
+        if let Some(pks) = matching_pks {
+            for pk in &pks {
+                if let Some(row_ref) = right_mirror.get(pk) {
+                    let r_row = Row::decode(row_ref.value(), &right_cols);
+                    // Combine row values
+                    let mut combined = l_row.values.clone();
+                    combined.extend_from_slice(&r_row.values);
+                    let combined_row = Row { values: combined };
+
+                    // Apply WHERE filter (for conditions on right table or cross-table)
+                    if matches_join_where(
+                        &combined_row,
+                        &parsed.where_conds,
+                        left_table,
+                        right_table,
+                        &left_cols,
+                        &right_cols,
+                    ) {
+                        joined_rows.push(combined_row);
+                    }
                 }
             }
         }
+        // If no index pks found, the left value has no match -- skip (inner join)
     }
 
     // ORDER BY

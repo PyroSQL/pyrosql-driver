@@ -209,6 +209,111 @@ fn decode_field(data: &[u8], type_tag: ColumnType) -> Value {
     }
 }
 
+/// Sentinel for NULL fields (re-exported for use by local_query raw comparison).
+pub const RAW_NULL_SENTINEL: u32 = NULL_SENTINEL;
+
+/// Skip through a raw-encoded row to find the byte offset and length of a given column.
+///
+/// Returns `Some((offset, len))` where `offset` is the start of the field data
+/// (after the length prefix), and `len` is the field data length.
+/// Returns `None` if the column is NULL or the row is truncated.
+///
+/// For NULL fields, returns `Some((offset, 0))` with a special marker:
+/// use `raw_field_is_null` to check first.
+pub fn raw_field_offset(raw: &[u8], col_idx: usize) -> Option<(usize, usize)> {
+    if raw.len() < 4 {
+        return None;
+    }
+    let num_cols = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+    if col_idx >= num_cols {
+        return None;
+    }
+    let mut pos = 4;
+    for _ in 0..col_idx {
+        if pos + 4 > raw.len() {
+            return None;
+        }
+        let field_len = u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]);
+        pos += 4;
+        if field_len != NULL_SENTINEL {
+            pos += field_len as usize;
+        }
+    }
+    if pos + 4 > raw.len() {
+        return None;
+    }
+    let field_len = u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]);
+    if field_len == NULL_SENTINEL {
+        return None; // NULL field
+    }
+    let data_start = pos + 4;
+    let len = field_len as usize;
+    if data_start + len > raw.len() {
+        return None;
+    }
+    Some((data_start, len))
+}
+
+/// Compare a raw field at the given column index against a literal Value without decoding.
+///
+/// Returns `true` if the raw field equals the literal.
+pub fn raw_field_eq(raw: &[u8], col_idx: usize, literal: &Value) -> bool {
+    if matches!(literal, Value::Null) {
+        // NULL comparison: field must be NULL sentinel
+        if raw.len() < 4 {
+            return false;
+        }
+        let num_cols = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        if col_idx >= num_cols {
+            return false;
+        }
+        let mut pos = 4;
+        for _ in 0..col_idx {
+            if pos + 4 > raw.len() {
+                return false;
+            }
+            let fl = u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]);
+            pos += 4;
+            if fl != NULL_SENTINEL {
+                pos += fl as usize;
+            }
+        }
+        if pos + 4 > raw.len() {
+            return false;
+        }
+        let fl = u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]);
+        return fl == NULL_SENTINEL;
+    }
+
+    let (offset, len) = match raw_field_offset(raw, col_idx) {
+        Some(v) => v,
+        None => return false,
+    };
+    let data = &raw[offset..offset + len];
+    match literal {
+        Value::Int64(n) => data.len() == 8 && i64::from_le_bytes(data.try_into().unwrap()) == *n,
+        Value::Float64(f) => {
+            data.len() == 8 && f64::from_le_bytes(data.try_into().unwrap()).to_bits() == f.to_bits()
+        }
+        Value::Text(s) => data == s.as_bytes(),
+        Value::Bool(b) => data.len() == 1 && (data[0] != 0) == *b,
+        Value::Bytes(b) => data == b.as_slice(),
+        Value::Null => false, // handled above
+    }
+}
+
+/// Read a raw field and decode it into a Value (single column decode).
+pub fn raw_field_decode(
+    raw: &[u8],
+    col_idx: usize,
+    type_tag: crate::protocol::ColumnType,
+) -> Value {
+    match raw_field_offset(raw, col_idx) {
+        None => Value::Null,
+        Some((offset, len)) => decode_field(&raw[offset..offset + len], type_tag),
+    }
+}
+
 /// Encode a row into the wire format used by mirrors.
 ///
 /// This is the inverse of [`Row::decode`] and is used to create test data.

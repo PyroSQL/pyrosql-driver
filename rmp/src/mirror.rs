@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// Estimated DashMap per-entry overhead in bytes (shard metadata, hash, pointers).
 const DASHMAP_ENTRY_OVERHEAD: u64 = 64;
 
+/// Global counter for unique mirror instance IDs.
+static MIRROR_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 /// A local mirror of subscribed data. Reads are direct memory access.
 pub struct TableMirror {
     /// Rows indexed by primary key bytes.
@@ -24,6 +27,8 @@ pub struct TableMirror {
     memory_bytes: AtomicU64,
     /// Whether this mirror is pinned (exempt from LRU eviction).
     pinned: AtomicBool,
+    /// Unique instance ID, monotonically increasing, to distinguish mirrors.
+    instance_id: u64,
 }
 
 /// Calculate the memory cost of a single row entry.
@@ -42,7 +47,13 @@ impl TableMirror {
             sub_id,
             memory_bytes: AtomicU64::new(0),
             pinned: AtomicBool::new(false),
+            instance_id: MIRROR_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Unique instance ID for this mirror (monotonically increasing).
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     /// Read a row by primary key. Zero network, ~50ns.
