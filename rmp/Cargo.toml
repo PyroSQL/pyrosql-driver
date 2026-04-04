@@ -33,3 +33,7 @@ path = "src/bin/bench_realistic.rs"
 [[bin]]
 name = "bench_fk_walker"
 path = "src/bin/bench_fk_walker.rs"
+
+[[bin]]
+name = "bench_local_query"
+path = "src/bin/bench_local_query.rs"
