@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.3.0] - 2026-04-09
+
+### Added
+- **Client-side SQL query engine** — SELECTs and JOINs resolved locally against LiveSync mirrors
+- Pre-sorted index for ORDER BY + LIMIT queries
+- Pre-decoded Arc<Row> cache for hot-path reads
+- Range LIMIT pushdown and hot plan cache
+
+### Performance
+- Local query engine: 2,671x faster than server round-trip
+- ORDER BY + LIMIT: 439 → 152K QPS (348x improvement)
+- Range queries: 893 → 5,962 QPS (6.7x with early LIMIT pushdown)
+- PK shortcut, secondary index lookup, lazy decode, index JOIN
+
 ## [1.2.0] - 2026-04-03
 
 ### Added
