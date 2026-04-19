@@ -25,5 +25,13 @@ thiserror  = { workspace = true }
 ring       = "0.17"
 base64     = "0.22"
 
+# PWire pyro-runtime backend (A-RT migration).  Cross-workspace path dep
+# into the main pyrosql repo — the dependency resolver walks up to pyrosql/
+# Cargo.toml for pyro-runtime's own workspace metadata.
+pyro-runtime = { path = "../../pyrosql/crates/pyro-runtime" }
+parking_lot  = "0.12"
+futures      = "0.3"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+dashmap = "6"
