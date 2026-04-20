@@ -36,7 +36,9 @@
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod mux;
 pub mod pool;
+pub mod pwire;
 pub mod row;
 pub mod scram_client;
 pub mod transport;
@@ -48,6 +50,7 @@ pub use client::{
 pub use config::{ConnectConfig, Scheme, SyntaxMode};
 pub use error::ClientError;
 pub use pool::{Pool, PooledClient};
+pub use pwire::{Pipeline, PipelineResponses, PyroWireConnection};
 pub use row::{ColumnMeta, FromValue, QueryResult, Row, Value};
 pub use transport::{
     Capabilities, MysqlTransport, TcpPgTransport, TopologyHints, TransportTier,
