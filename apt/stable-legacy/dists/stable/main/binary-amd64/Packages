@@ -1,13 +1,32 @@
+Package: pyrosql-cli
+Version: 1.3.3-1
+Architecture: amd64
+Maintainer: Una Partida Mas SRL <info@pyrosql.com>
+Installed-Size: 1995
+Filename: pool/main/pyrosql-cli_1.3.3-1_amd64.deb
+Size: 653052
+MD5sum: 8f7dffe15a83a69c5d3c3c6db7defbbd
+SHA1: a1d2f8f475f99c242ca3609128d816b5c9029fd8
+SHA256: 3b94351f0ddcb2e73a3048471f8447ebfafe77c921dcd1fad5a7bec9668af925
+Section: database
+Priority: optional
+Homepage: https://pyrosql.com
+Description: PyroSQL command-line REPL client (psql-equivalent)
+ PyroSQL command-line client (psql-equivalent). Interactive SQL REPL
+ with history, meta commands, multi-format output (table/json/csv),
+ and script execution. Connects to any PyroSQL server via the PWire
+ protocol. Does NOT include the server.
+
 Package: pyrosql-driver
-Version: 1.3.1-1
+Version: 1.3.3-1
 Architecture: amd64
 Maintainer: Una Partida Mas SRL <info@pyrosql.com>
 Installed-Size: 381
-Filename: pool/main/pyrosql-driver_1.3.1-1_amd64.deb
-Size: 164180
-MD5sum: e90691e804474314697fe50469e35676
-SHA1: 149ef6834e6555940bee25b33968ab02d4f9b257
-SHA256: b5e163848a847994c6cb6046fa1f50cfe70c904b51f3677f35c705de4ceaa8cd
+Filename: pool/main/pyrosql-driver_1.3.3-1_amd64.deb
+Size: 164124
+MD5sum: 0e6f255c7063e113ff3b7eb8faf08329
+SHA1: 1ad6ee3986fcce60aa6e4c39be2a9d9eec5a10c4
+SHA256: 5ddc035b7e88f248c8e0a40b22ea238e0192841ae1c48c544b8c82dd85d83369
 Section: libs
 Priority: optional
 Homepage: https://pyrosql.com
