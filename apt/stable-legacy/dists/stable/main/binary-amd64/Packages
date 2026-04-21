@@ -1,13 +1,13 @@
 Package: pyrosql-driver
-Version: 1.1.0-1
+Version: 1.3.1-1
 Architecture: amd64
 Maintainer: Una Partida Mas SRL <info@pyrosql.com>
 Installed-Size: 381
-Filename: pool/main/pyrosql-driver_1.1.0-1_amd64.deb
-Size: 164100
-MD5sum: d63920a5772a9c899386da0961bfe6f1
-SHA1: 3b69833ecc9bdb5440ec8717cfaa2b553051c655
-SHA256: aa2f0dd28c7c2b0d3b2e6a2287e36584a88e57c1fc1846271cbe42ae205a4b3f
+Filename: pool/main/pyrosql-driver_1.3.1-1_amd64.deb
+Size: 164180
+MD5sum: e90691e804474314697fe50469e35676
+SHA1: 149ef6834e6555940bee25b33968ab02d4f9b257
+SHA256: b5e163848a847994c6cb6046fa1f50cfe70c904b51f3677f35c705de4ceaa8cd
 Section: libs
 Priority: optional
 Homepage: https://pyrosql.com
