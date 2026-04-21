@@ -168,13 +168,13 @@ jobs:
               cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
               cargo deb --manifest-path ffi-pwire/Cargo.toml --target ${{ matrix.target }} --no-build
 
-              # Tag the filename with the track (stable / stable-legacy) so
-              # the publish job can route it into the right pool.
-              cd ffi-pwire/target/${{ matrix.target }}/debian
-              for f in *.deb; do
-                mv "$f" "${f%.deb}_${{ matrix.track }}.deb"
-              done
-              ls -la
+              # Leave the filename in standard Debian format
+              # (pyrosql-driver_<ver>_<arch>.deb). The track is already
+              # encoded in the upload-artifact name (debs-<track>-<arch>)
+              # and the publish job routes artifacts into per-track pools
+              # based on that — no need to mangle the filename, which
+              # breaks `dpkg-scanpackages` arch parsing.
+              ls -la ffi-pwire/target/${{ matrix.target }}/debian/
             '
 
       - uses: actions/upload-artifact@v4
@@ -230,13 +230,10 @@ jobs:
               cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
               cargo generate-rpm -p ffi-pwire --target ${{ matrix.target }} --payload-compress zstd
 
-              # Retag rpm with the track suffix before .rpm so the publish
-              # job routes to the right pool (stable vs stable-legacy).
-              cd target/${{ matrix.target }}/generate-rpm
-              for f in *.rpm; do
-                mv "$f" "${f%.rpm}.${{ matrix.track }}.rpm"
-              done
-              ls -la
+              # Same reasoning as .deb — keep the standard
+              # <name>-<ver>.<arch>.rpm filename so createrepo_c parses
+              # the arch correctly. Track is routed via artifact name.
+              ls -la target/${{ matrix.target }}/generate-rpm/
             '
 
       - uses: actions/upload-artifact@v4
@@ -354,44 +351,64 @@ jobs:
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
           gpg --list-secret-keys --keyid-format LONG
 
+      # Download each artifact into its own subdirectory so we can route
+      # by the folder name (which encodes the track) rather than by the
+      # filename (which we deliberately kept as plain
+      # `pyrosql-driver_<v>_<arch>.deb` to not break dpkg-scanpackages).
       - uses: actions/download-artifact@v4
         with:
           pattern: debs-*
           path: debs
-          merge-multiple: true
+          merge-multiple: false   # keeps per-artifact subfolders
 
       - uses: actions/download-artifact@v4
         with:
           pattern: rpms-*
           path: rpms
-          merge-multiple: true
+          merge-multiple: false
 
       - name: Route .deb into per-track pool
         run: |
-          # Files are named *_stable.deb or *_stable-legacy.deb (from the
-          # rename step in build-deb). Route by suffix before the .deb.
-          for f in debs/*.deb; do
-            case "$f" in
-              *_stable-legacy.deb) cp "$f" site/apt/stable-legacy/pool/main/ ;;
-              *_stable.deb)        cp "$f" site/apt/stable/pool/main/ ;;
-              *) echo "::warning::unknown track suffix for $f" ;;
+          # Artifact folders look like:
+          #   debs/debs-stable-amd64/*.deb
+          #   debs/debs-stable-legacy-arm64/*.deb
+          # Track = middle chunk between `debs-` and the trailing `-<arch>`.
+          for d in debs/debs-*; do
+            [ -d "$d" ] || continue
+            base=$(basename "$d")            # e.g. debs-stable-legacy-amd64
+            # strip leading "debs-" and trailing "-amd64" / "-arm64"
+            track=${base#debs-}
+            track=${track%-amd64}
+            track=${track%-arm64}
+            case "$track" in
+              stable|stable-legacy)
+                cp "$d"/*.deb site/apt/$track/pool/main/
+                ;;
+              *) echo "::warning::unknown track ($track) in artifact $base" ;;
             esac
           done
+          find site/apt -name '*.deb' -print
 
       - name: Route .rpm into per-track/per-arch pool
         run: |
-          # Files end .stable.rpm or .stable-legacy.rpm (rename in build-rpm).
-          for f in rpms/*.rpm; do
-            arch=x86_64
-            case "$f" in
-              *aarch64*) arch=aarch64 ;;
+          for d in rpms/rpms-*; do
+            [ -d "$d" ] || continue
+            base=$(basename "$d")            # e.g. rpms-stable-legacy-aarch64
+            case "$base" in
+              *-aarch64) arch=aarch64 ;;
+              *)         arch=x86_64  ;;
             esac
-            case "$f" in
-              *.stable-legacy.rpm) cp "$f" site/yum/stable-legacy/$arch/ ;;
-              *.stable.rpm)        cp "$f" site/yum/stable/$arch/ ;;
-              *) echo "::warning::unknown track suffix for $f" ;;
+            track=${base#rpms-}
+            track=${track%-x86_64}
+            track=${track%-aarch64}
+            case "$track" in
+              stable|stable-legacy)
+                cp "$d"/*.rpm site/yum/$track/$arch/
+                ;;
+              *) echo "::warning::unknown track ($track) in artifact $base" ;;
             esac
           done
+          find site/yum -name '*.rpm' -print
 
       - name: Regenerate apt metadata (per track)
         env:
