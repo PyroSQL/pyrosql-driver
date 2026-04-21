@@ -17,6 +17,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # pyro-runtime is fetched from the private PyroSQL/pyrosql repo.
+      # Runners need a PAT with read access stored as secret
+      # PYROSQL_REPO_TOKEN.  If the secret is missing the job continues
+      # but will fail at `cargo fetch`; we emit a clear ::warning::
+      # describing the fix.
+      - name: Configure git to fetch pyro-runtime via token
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
+        run: |
+          if [ -z "$PYROSQL_REPO_TOKEN" ]; then
+            echo "::warning::PYROSQL_REPO_TOKEN secret is not set — cargo will fail to resolve pyro-runtime. Create a fine-grained PAT with read access to PyroSQL/pyrosql and save it as the repo secret PYROSQL_REPO_TOKEN."
+          else
+            git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+
       - run: cargo check --workspace
       - run: cargo test --workspace
 
@@ -27,6 +43,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # ffi-pwire is standalone (no pyro-runtime dep) — no token needed.
       - run: cargo build --manifest-path ffi-pwire/Cargo.toml
 
   check-python:

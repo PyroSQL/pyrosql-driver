@@ -2,7 +2,7 @@
 name = "pyrosql"
 version = "1.1.0"
 edition = "2021"
-description = "Official Rust driver for PyroSQL — PWire binary protocol"
+description = "Official Rust driver for PyroSQL — PWire binary protocol only"
 license = "MIT"
 repository = "https://github.com/pyrosql/pyrosql-driver"
 homepage = "https://pyrosql.com"
@@ -13,25 +13,65 @@ categories = ["database"]
 name = "pyrosql"
 
 [dependencies]
-pyrosql-protocol = { path = "../protocol", version = "1.1.0" }
-quinn   = { workspace = true, features = ["rustls"] }
-rustls  = { workspace = true }
-rcgen   = "0.12"
-bytes   = { workspace = true }
-tokio   = { workspace = true, features = ["rt", "net", "io-util", "time", "sync"] }
-serde   = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-thiserror  = { workspace = true }
-ring       = "0.17"
-base64     = "0.22"
-
-# PWire pyro-runtime backend (A-RT migration).  Cross-workspace path dep
-# into the main pyrosql repo — the dependency resolver walks up to pyrosql/
-# Cargo.toml for pyro-runtime's own workspace metadata.
-pyro-runtime = { path = "../../pyrosql/crates/pyro-runtime" }
-parking_lot  = "0.12"
+# Core async + sync primitives.
 futures      = "0.3"
+parking_lot  = "0.12"
+serde        = { workspace = true, features = ["derive"] }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+
+# SCRAM-SHA-256 auth (PBKDF2 + HMAC-SHA256) + base64 framing.
+base64       = "0.22"
+ring         = "0.17"
+
+# PWire runtime: io_uring-backed reactor, pulled via git so CI runners
+# resolve it without needing the sibling `pyrosql/` checkout.  The
+# workflow must configure a PAT `PYROSQL_REPO_TOKEN` with read access
+# to `PyroSQL/pyrosql` before `cargo fetch`.
+pyro-runtime = { git = "https://github.com/PyroSQL/pyrosql.git", branch = "main" }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
 dashmap = "6"
+
+# ── Standalone example benches ──
+# All of these are runtime-agnostic (use `futures::executor::block_on`
+# or raw std-sockets), so no dev-dep on tokio is required.
+[[example]]
+name = "mux_smoke"
+path = "examples/mux_smoke.rs"
+
+[[example]]
+name = "bench_pipeline"
+path = "examples/bench_pipeline.rs"
+
+[[example]]
+name = "bench_pwire_prepare"
+path = "examples/bench_pwire_prepare.rs"
+
+[[example]]
+name = "bench_mux"
+path = "examples/bench_mux.rs"
+
+[[example]]
+name = "bench_insert_raw"
+path = "examples/bench_insert_raw.rs"
+
+[[example]]
+name = "bench_update_raw"
+path = "examples/bench_update_raw.rs"
+
+[[example]]
+name = "bench_multi_insert_pg"
+path = "examples/bench_multi_insert_pg.rs"
+
+[[example]]
+name = "bench_pipeline_raw"
+path = "examples/bench_pipeline_raw.rs"
+
+[[example]]
+name = "bench_setup"
+path = "examples/bench_setup.rs"
+
+[[example]]
+name = "bench_livesync"
+path = "examples/bench_livesync.rs"

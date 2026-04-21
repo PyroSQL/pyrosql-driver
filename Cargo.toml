@@ -1,5 +1,8 @@
 [workspace]
 members = ["rust", "protocol", "rmp"]
+# `ffi-quic` is archived (QUIC transport removed from the driver).  Keep
+# it excluded from the workspace so `cargo check --workspace` does not
+# try to compile it — remove entirely in a follow-up.
 exclude = ["python", "ffi-quic", "ffi-pwire"]
 resolver = "2"
 
@@ -16,3 +19,11 @@ serde_json = "1"
 thiserror = "2"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# ── Local development override ──
+# When a sibling checkout of the main PyroSQL repository is available at
+# ../pyrosql, prefer it over the git dep so edits to pyro-runtime are
+# picked up without a commit+push cycle.  CI runners (without the sibling
+# checkout) fall back to the git dep declared in `rust/Cargo.toml`.
+[patch."https://github.com/PyroSQL/pyrosql.git"]
+pyro-runtime = { path = "../pyrosql/crates/pyro-runtime" }

@@ -3,7 +3,7 @@
 /// Errors returned by the PyroSQL client.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    /// Failed to establish a QUIC connection.
+    /// Failed to establish (or keep) the TCP connection.
     #[error("connection failed: {0}")]
     Connection(String),
 
@@ -19,11 +19,7 @@ pub enum ClientError {
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
 
-    /// TLS configuration or handshake failure.
-    #[error("TLS error: {0}")]
-    Tls(String),
-
-    /// I/O error on the underlying QUIC stream.
+    /// I/O error on the underlying stream.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
