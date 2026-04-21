@@ -1,6 +1,6 @@
 [package]
 name = "pyrosql-ffi-pwire"
-version = "1.3.1"
+version = "1.3.3"
 edition = "2021"
 description = "C-ABI shared library for PWire (raw TCP SQL client)"
 license = "MIT"

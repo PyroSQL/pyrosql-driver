@@ -1,0 +1,36 @@
+# Contributor: Una Partida Mas SRL <info@pyrosql.com>
+# Maintainer:  Una Partida Mas SRL <info@pyrosql.com>
+#
+# TEMPLATE — sibling of APKBUILD.in, but for the `pyrosql-cli` package
+# (the interactive REPL binary). Payload = `pyrosql`, pre-built with
+# `cargo build -p pyrosql-cli --release --target <musl-triple>` on the
+# runner before this APKBUILD is invoked (same pre-build strategy as
+# the driver APKBUILD — the Alpine CI container has no git-token
+# plumbing to resolve the private pyro-runtime dep).
+pkgname=pyrosql-cli
+pkgver=@PKGVER@
+pkgrel=0
+pkgdesc="PyroSQL command-line REPL client (psql-equivalent)"
+url="https://pyrosql.com"
+arch="x86_64 aarch64"
+license="MIT"
+# `pyrosql` links libpyrosql statically (the rust driver crate is a
+# rlib), so no runtime dep on pyrosql-driver. Keep the packages
+# independent — users install either or both.
+depends=""
+makedepends=""
+source="pyrosql
+	LICENSE
+	"
+options="!check"
+
+build() {
+	:
+}
+
+package() {
+	install -Dm755 "$srcdir"/pyrosql \
+		"$pkgdir"/usr/bin/pyrosql
+	install -Dm644 "$srcdir"/LICENSE \
+		"$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+}

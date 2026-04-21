@@ -52,7 +52,12 @@ html = f"""<!doctype html>
 
 <header>
   <h1><span class="orange">PyroSQL</span> driver &middot; install</h1>
-  <p>PostgreSQL-wire-compatible database client. Link your application against <code>libpyrosql_ffi_pwire.so</code> and connect to any PyroSQL server.</p>
+  <p>Database client for the PWire binary protocol. Two packages ship from this repo:</p>
+  <ul>
+    <li><code>pyrosql-driver</code> &mdash; the C-ABI shared library (<code>libpyrosql_ffi_pwire.so</code>) your application links against.</li>
+    <li><code>pyrosql-cli</code> &mdash; the <code>pyrosql</code> REPL binary (psql-equivalent). Independent of the shared library; install whichever you need.</li>
+  </ul>
+  <p>Typical install: <code>sudo apt install pyrosql-driver pyrosql-cli</code> &mdash; then <code>pyrosql --host myserver.example.com --user me</code>.</p>
 </header>
 
 <div class="note">
@@ -68,13 +73,13 @@ html = f"""<!doctype html>
 <pre><code>curl -fsSL https://{url}/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/pyrosql.gpg
 echo "deb [signed-by=/usr/share/keyrings/pyrosql.gpg] https://{url}/apt/stable stable main" | sudo tee /etc/apt/sources.list.d/pyrosql.list
 sudo apt update
-sudo apt install pyrosql-driver</code></pre>
+sudo apt install pyrosql-driver pyrosql-cli</code></pre>
 
 <h3><span class="badge badge-legacy">legacy</span> Ubuntu 14.04 &ndash; 18.04 / Debian 8 &ndash; 10</h3>
 <pre><code>curl -fsSL https://{url}/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/pyrosql.gpg
 echo "deb [signed-by=/usr/share/keyrings/pyrosql.gpg] https://{url}/apt/stable-legacy stable main" | sudo tee /etc/apt/sources.list.d/pyrosql.list
 sudo apt update
-sudo apt install pyrosql-driver</code></pre>
+sudo apt install pyrosql-driver pyrosql-cli</code></pre>
 
 <h2>Fedora &middot; RHEL &middot; Rocky &middot; Alma &middot; CentOS Stream &middot; Amazon Linux</h2>
 
@@ -87,7 +92,7 @@ enabled=1
 gpgcheck=1
 gpgkey=https://{url}/gpg.key
 EOF
-sudo dnf install pyrosql-driver</code></pre>
+sudo dnf install pyrosql-driver pyrosql-cli</code></pre>
 
 <h3><span class="badge badge-legacy">legacy</span> RHEL 7 / CentOS 7 / Amazon Linux 2</h3>
 <pre><code>sudo tee /etc/yum.repos.d/pyrosql.repo &lt;&lt;'EOF'
@@ -98,19 +103,19 @@ enabled=1
 gpgcheck=1
 gpgkey=https://{url}/gpg.key
 EOF
-sudo yum install pyrosql-driver</code></pre>
+sudo yum install pyrosql-driver pyrosql-cli</code></pre>
 
 <h2>openSUSE &middot; SUSE Linux Enterprise</h2>
 <pre><code>sudo zypper addrepo --gpgcheck --refresh https://{url}/yum/stable/$basearch/ pyrosql
 sudo rpm --import https://{url}/gpg.key
-sudo zypper install pyrosql-driver</code></pre>
+sudo zypper install pyrosql-driver pyrosql-cli</code></pre>
 
 <h2>Alpine Linux</h2>
 <p>Alpine uses musl libc, so it gets its own build + its own RSA signing scheme (separate from the apt/yum GPG key). One track only &mdash; the <code>stable</code> repo is built against Alpine 3.19 (musl 1.2.4) and runs on any Alpine 3.17+.</p>
 <pre><code>sudo wget -O /etc/apk/keys/info-pyrosql-com.rsa.pub https://{url}/apk/info-pyrosql-com.rsa.pub
 echo "https://{url}/apk/stable" | sudo tee -a /etc/apk/repositories
 sudo apk update
-sudo apk add pyrosql-driver</code></pre>
+sudo apk add pyrosql-driver pyrosql-cli</code></pre>
 
 <h2>Other languages &middot; other platforms</h2>
 
@@ -125,12 +130,19 @@ sudo apk add pyrosql-driver</code></pre>
 </table>
 
 <h2>Verify the installation</h2>
-<pre><code># Ensure the shared library is loadable
+<pre><code># Driver: the shared library must be loadable
 ldconfig -p | grep pyrosql
 # -> libpyrosql_ffi_pwire.so (libc6,x86-64) =&gt; /usr/lib/x86_64-linux-gnu/libpyrosql_ffi_pwire.so
 
-# Check the package version
-apt show pyrosql-driver 2&gt;/dev/null || rpm -qi pyrosql-driver 2&gt;/dev/null || apk info -v pyrosql-driver</code></pre>
+# CLI: the pyrosql REPL binary
+which pyrosql &amp;&amp; pyrosql --version
+# -> /usr/bin/pyrosql
+# -> pyrosql 1.3.x
+
+# Check the package versions
+apt show pyrosql-driver pyrosql-cli 2&gt;/dev/null \
+  || rpm -qi pyrosql-driver pyrosql-cli 2&gt;/dev/null \
+  || apk info -v pyrosql-driver pyrosql-cli</code></pre>
 
 <h2>Troubleshooting</h2>
 
@@ -145,15 +157,15 @@ apt show pyrosql-driver 2&gt;/dev/null || rpm -qi pyrosql-driver 2&gt;/dev/null 
 
 <h2>Uninstall</h2>
 <pre><code># Debian / Ubuntu
-sudo apt remove pyrosql-driver
+sudo apt remove pyrosql-driver pyrosql-cli
 sudo rm /etc/apt/sources.list.d/pyrosql.list /usr/share/keyrings/pyrosql.gpg
 
 # RHEL / Fedora
-sudo dnf remove pyrosql-driver
+sudo dnf remove pyrosql-driver pyrosql-cli
 sudo rm /etc/yum.repos.d/pyrosql.repo
 
 # Alpine
-sudo apk del pyrosql-driver
+sudo apk del pyrosql-driver pyrosql-cli
 sudo sed -i '/pyrosql-driver\\/apk\\/stable/d' /etc/apk/repositories
 sudo rm /etc/apk/keys/info-pyrosql-com.rsa.pub</code></pre>
 

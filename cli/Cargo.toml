@@ -1,0 +1,73 @@
+[package]
+name = "pyrosql-cli"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+description = "PyroSQL command-line REPL client (psql-equivalent)"
+repository = "https://github.com/PyroSQL/pyrosql-driver"
+homepage = "https://pyrosql.com"
+
+[[bin]]
+name = "pyrosql"
+path = "src/main.rs"
+
+[dependencies]
+# Sole transport: the zero-tokio pyrosql driver in ../rust. Anything else
+# would re-introduce an async runtime and violate the core constraint.
+pyrosql     = { path = "../rust" }
+
+# Pure-sync REPL. rustyline has zero tokio dependency — it calls
+# termios/wcwidth/etc directly. musl-compatible.
+rustyline   = "15"
+
+# CLI argument parsing + --help rendering.
+clap        = { version = "4", features = ["derive"] }
+
+# Pretty table output. Works fine on musl.
+comfy-table = "7"
+
+# JSON / CSV output modes.
+serde       = { workspace = true, features = ["derive"] }
+serde_json  = { workspace = true }
+
+# Error plumbing.
+anyhow      = "1"
+
+# Block on async driver futures without a runtime.
+futures     = "0.3"
+
+# No-echo password prompt (termios on Unix, Console* on Windows).
+# Pure sync, no tokio. musl-compatible.
+rpassword   = "7"
+
+# ────────────────────────────────────────────────────────────────────────
+# Distribution packaging — CLIENT REPL (`pyrosql-cli`).
+#
+# Separate package from `pyrosql-driver` (the C-ABI shared library):
+# users install both — `apt install pyrosql-driver pyrosql-cli` — and
+# get a working REPL + the library to link against.
+# ────────────────────────────────────────────────────────────────────────
+[package.metadata.deb]
+name = "pyrosql-cli"
+maintainer = "Una Partida Mas SRL <info@pyrosql.com>"
+copyright = "2025-2026 Una Partida Mas SRL"
+license-file = ["../LICENSE", "0"]
+extended-description = """
+PyroSQL command-line client (psql-equivalent). Interactive SQL REPL
+with history, meta commands, multi-format output (table/json/csv),
+and script execution. Connects to any PyroSQL server via the PWire
+protocol. Does NOT include the server."""
+depends = "$auto"
+section = "database"
+priority = "optional"
+assets = [
+    ["target/release/pyrosql", "usr/bin/pyrosql", "755"],
+]
+
+[package.metadata.generate-rpm]
+name = "pyrosql-cli"
+summary = "PyroSQL command-line REPL client"
+license = "MIT"
+assets = [
+    { source = "target/release/pyrosql", dest = "/usr/bin/pyrosql", mode = "755" },
+]

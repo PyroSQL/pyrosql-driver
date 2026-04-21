@@ -1,5 +1,5 @@
 [workspace]
-members = ["rust", "protocol", "rmp"]
+members = ["rust", "protocol", "rmp", "cli"]
 # `ffi-quic` is archived (QUIC transport removed from the driver).  Keep
 # it excluded from the workspace so `cargo check --workspace` does not
 # try to compile it — remove entirely in a follow-up.
@@ -7,7 +7,7 @@ exclude = ["python", "ffi-quic", "ffi-pwire"]
 resolver = "2"
 
 [workspace.package]
-version = "1.3.1"
+version = "1.3.3"
 edition = "2021"
 license = "BSL-1.1"
 

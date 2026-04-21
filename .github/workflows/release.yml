@@ -414,11 +414,258 @@ jobs:
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────────────────
+  # .deb / .rpm / .apk for the `pyrosql-cli` package (REPL binary). Same
+  # matrix shape as the driver jobs so artefacts land next to each other
+  # in the apt/yum/apk pools. The only thing that changes is the
+  # manifest path (`cli/Cargo.toml`) and the binary that ends up in the
+  # package (`target/<triple>/release/pyrosql`).
+  # ─────────────────────────────────────────────────────────────────────────
+  build-deb-cli:
+    name: Build .deb cli (${{ matrix.track }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { track: stable,        arch: amd64, target: x86_64-unknown-linux-gnu,  runner: ubuntu-latest,    container: "quay.io/pypa/manylinux_2_28_x86_64" }
+          - { track: stable,        arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux_2_28_aarch64" }
+          - { track: stable-legacy, arch: amd64, target: x86_64-unknown-linux-gnu,  runner: ubuntu-latest,    container: "quay.io/pypa/manylinux2014_x86_64" }
+          - { track: stable-legacy, arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux2014_aarch64" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git to fetch pyro-runtime via token
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
+        run: |
+          if [ -z "$PYROSQL_REPO_TOKEN" ]; then
+            echo "::error::PYROSQL_REPO_TOKEN secret missing — cannot resolve private pyro-runtime dep."
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Build cli .deb inside manylinux container
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            -e PYROSQL_REPO_TOKEN="$PYROSQL_REPO_TOKEN" \
+            -e CARGO_TERM_COLOR=always \
+            ${{ matrix.container }} \
+            bash -euxc '
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain 1.94.1 --profile minimal --target ${{ matrix.target }}
+              export PATH="$HOME/.cargo/bin:$PATH"
+
+              git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+              yum install -y dpkg dpkg-dev 2>/dev/null || \
+                dnf install -y dpkg dpkg-dev 2>/dev/null || \
+                true
+
+              cargo install cargo-deb --locked
+
+              # Build the binary from the workspace so the deb layout
+              # (target/release/pyrosql) matches the `assets` entry.
+              cargo build -p pyrosql-cli --release --target ${{ matrix.target }}
+              cargo deb --manifest-path cli/Cargo.toml --target ${{ matrix.target }} --no-build
+
+              ls -la target/${{ matrix.target }}/debian/
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-cli-${{ matrix.track }}-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/debian/*.deb
+          if-no-files-found: error
+
+  build-rpm-cli:
+    name: Build .rpm cli (${{ matrix.track }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { track: stable,        arch: x86_64,  target: x86_64-unknown-linux-gnu,  runner: ubuntu-latest,    container: "quay.io/pypa/manylinux_2_28_x86_64" }
+          - { track: stable,        arch: aarch64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux_2_28_aarch64" }
+          - { track: stable-legacy, arch: x86_64,  target: x86_64-unknown-linux-gnu,  runner: ubuntu-latest,    container: "quay.io/pypa/manylinux2014_x86_64" }
+          - { track: stable-legacy, arch: aarch64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux2014_aarch64" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git to fetch pyro-runtime via token
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
+        run: |
+          if [ -z "$PYROSQL_REPO_TOKEN" ]; then
+            echo "::error::PYROSQL_REPO_TOKEN secret missing — cannot resolve private pyro-runtime dep."
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Build cli .rpm inside manylinux container
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            -e PYROSQL_REPO_TOKEN="$PYROSQL_REPO_TOKEN" \
+            -e CARGO_TERM_COLOR=always \
+            ${{ matrix.container }} \
+            bash -euxc '
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain 1.94.1 --profile minimal --target ${{ matrix.target }}
+              export PATH="$HOME/.cargo/bin:$PATH"
+
+              git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+              cargo install cargo-generate-rpm --locked
+
+              cargo build -p pyrosql-cli --release --target ${{ matrix.target }}
+              cargo generate-rpm -p cli --target ${{ matrix.target }} --payload-compress zstd
+
+              # cargo-generate-rpm writes to <workspace>/target/<triple>/generate-rpm/
+              ls -la target/${{ matrix.target }}/generate-rpm/
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpms-cli-${{ matrix.track }}-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/generate-rpm/*.rpm
+          if-no-files-found: error
+
+  build-apk-cli:
+    name: Build .apk cli (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  target: x86_64-unknown-linux-musl,  runner: ubuntu-latest    }
+          - { arch: aarch64, target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Alpine signing key secret
+        id: check_key
+        env:
+          ALPINE_SIGNING_PRIVATE_KEY: ${{ secrets.ALPINE_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$ALPINE_SIGNING_PRIVATE_KEY" ]; then
+            echo "::warning::ALPINE_SIGNING_PRIVATE_KEY secret missing — skipping .apk cli build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure git to fetch pyro-runtime via token
+        if: steps.check_key.outputs.skip != 'true'
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
+        run: |
+          if [ -z "$PYROSQL_REPO_TOKEN" ]; then
+            echo "::error::PYROSQL_REPO_TOKEN secret missing — cannot resolve private pyro-runtime dep."
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Extract workspace version
+        if: steps.check_key.outputs.skip != 'true'
+        id: ver
+        run: |
+          v=$(grep -E '^\s*version\s*=' Cargo.toml | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "pkgver=$v" >> "$GITHUB_OUTPUT"
+          echo "Detected workspace version: $v"
+
+      - name: Build cli .apk inside alpine:3.19
+        if: steps.check_key.outputs.skip != 'true'
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
+          ALPINE_SIGNING_PRIVATE_KEY: ${{ secrets.ALPINE_SIGNING_PRIVATE_KEY }}
+          PKGVER: ${{ steps.ver.outputs.pkgver }}
+          RUST_TARGET: ${{ matrix.target }}
+          APK_ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p /tmp/alpine-keys-cli
+          printf '%s' "$ALPINE_SIGNING_PRIVATE_KEY" > /tmp/alpine-keys-cli/info-pyrosql-com.rsa
+          chmod 600 /tmp/alpine-keys-cli/info-pyrosql-com.rsa
+          cp .github/alpine-signing/info-pyrosql-com.rsa.pub /tmp/alpine-keys-cli/
+
+          mkdir -p /tmp/apk-cli-out
+
+          docker run --rm \
+            -v "${{ github.workspace }}:/src:ro" \
+            -v /tmp/alpine-keys-cli:/keys:ro \
+            -v /tmp/apk-cli-out:/out \
+            -e PYROSQL_REPO_TOKEN="$PYROSQL_REPO_TOKEN" \
+            -e PKGVER="$PKGVER" \
+            -e RUST_TARGET="$RUST_TARGET" \
+            -e APK_ARCH="$APK_ARCH" \
+            -e CARGO_TERM_COLOR=always \
+            alpine:3.19 \
+            sh -euxc '
+              apk add --no-cache alpine-sdk sudo openssl curl git bash coreutils
+
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain 1.94.1 --profile minimal --target "$RUST_TARGET"
+              . "$HOME/.cargo/env"
+
+              git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+              cp -a /src /build
+              cd /build
+
+              cargo build -p pyrosql-cli --release --target "$RUST_TARGET"
+
+              adduser -D -G abuild builder
+              echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+              mkdir -p /home/builder/pkg
+              sed "s/@PKGVER@/${PKGVER}/g" alpine/APKBUILD-cli.in > /home/builder/pkg/APKBUILD
+              cp "target/${RUST_TARGET}/release/pyrosql" /home/builder/pkg/pyrosql
+              cp LICENSE /home/builder/pkg/
+              chown -R builder:abuild /home/builder
+
+              su builder -c "mkdir -p /home/builder/.abuild"
+              cp /keys/info-pyrosql-com.rsa  /home/builder/.abuild/info-pyrosql-com.rsa
+              cp /keys/info-pyrosql-com.rsa.pub /home/builder/.abuild/info-pyrosql-com.rsa.pub
+              chown builder:abuild /home/builder/.abuild/info-pyrosql-com.rsa*
+              chmod 600 /home/builder/.abuild/info-pyrosql-com.rsa
+              printf "PACKAGER_PRIVKEY=/home/builder/.abuild/info-pyrosql-com.rsa\n" \
+                > /home/builder/.abuild/abuild.conf
+              chown builder:abuild /home/builder/.abuild/abuild.conf
+
+              cp /keys/info-pyrosql-com.rsa.pub /etc/apk/keys/
+
+              cd /home/builder/pkg
+              su builder -c "cd /home/builder/pkg && abuild checksum"
+              su builder -c "cd /home/builder/pkg && abuild -r"
+
+              mkdir -p /out
+              find /home/builder/packages -name "*.apk" -print -exec cp {} /out/ \;
+              ls -la /out/
+            '
+
+          ls -la /tmp/apk-cli-out/
+          mkdir -p dist
+          cp /tmp/apk-cli-out/*.apk dist/
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check_key.outputs.skip != 'true'
+        with:
+          name: apks-cli-${{ matrix.arch }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────
   # GitHub Release — bundles tarballs, Python wheel, .deb, .rpm as assets
   # ─────────────────────────────────────────────────────────────────────────
   create-release:
     name: GitHub Release
-    needs: [build-ffi, build-python, build-deb, build-rpm, build-apk]
+    needs: [build-ffi, build-python, build-deb, build-rpm, build-apk, build-deb-cli, build-rpm-cli, build-apk-cli]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -483,7 +730,7 @@ jobs:
   publish-apt-yum:
     name: Publish apt + yum + apk repo
     runs-on: ubuntu-latest
-    needs: [build-deb, build-rpm, build-apk]
+    needs: [build-deb, build-rpm, build-apk, build-deb-cli, build-rpm-cli, build-apk-cli]
     if: "!contains(github.ref, '-rc')"
     steps:
       # Check out `main` at the workflow root — gives us tools/gen_install_page.py
@@ -561,14 +808,19 @@ jobs:
       - name: Route .deb into per-track pool
         run: |
           # Artifact folders look like:
-          #   debs/debs-stable-amd64/*.deb
-          #   debs/debs-stable-legacy-arm64/*.deb
-          # Track = middle chunk between `debs-` and the trailing `-<arch>`.
+          #   debs/debs-stable-amd64/*.deb                (driver, stable)
+          #   debs/debs-stable-legacy-arm64/*.deb         (driver, legacy)
+          #   debs/debs-cli-stable-amd64/*.deb            (cli, stable)
+          #   debs/debs-cli-stable-legacy-arm64/*.deb     (cli, legacy)
+          # Track = middle chunk between `debs-` (optional `cli-`) and the
+          # trailing `-<arch>`.  Both packages land in the same pool so
+          # `apt install pyrosql-driver pyrosql-cli` resolves from one repo.
           for d in debs/debs-*; do
             [ -d "$d" ] || continue
-            base=$(basename "$d")            # e.g. debs-stable-legacy-amd64
-            # strip leading "debs-" and trailing "-amd64" / "-arm64"
+            base=$(basename "$d")            # e.g. debs-cli-stable-legacy-amd64
+            # strip leading "debs-" and optional "cli-"
             track=${base#debs-}
+            track=${track#cli-}
             track=${track%-amd64}
             track=${track%-arm64}
             case "$track" in
@@ -582,14 +834,18 @@ jobs:
 
       - name: Route .rpm into per-track/per-arch pool
         run: |
+          # Same pattern as .deb — driver and cli RPMs share the same
+          # per-track/per-arch pool so `dnf install pyrosql-driver pyrosql-cli`
+          # resolves from one repo.
           for d in rpms/rpms-*; do
             [ -d "$d" ] || continue
-            base=$(basename "$d")            # e.g. rpms-stable-legacy-aarch64
+            base=$(basename "$d")            # e.g. rpms-cli-stable-legacy-aarch64
             case "$base" in
               *-aarch64) arch=aarch64 ;;
               *)         arch=x86_64  ;;
             esac
             track=${base#rpms-}
+            track=${track#cli-}
             track=${track%-x86_64}
             track=${track%-aarch64}
             case "$track" in
@@ -612,8 +868,9 @@ jobs:
           fi
           for d in apks/apks-*; do
             [ -d "$d" ] || continue
-            base=$(basename "$d")            # e.g. apks-x86_64 or apks-aarch64
+            base=$(basename "$d")            # apks-{,cli-}{x86_64,aarch64}
             arch=${base#apks-}
+            arch=${arch#cli-}
             case "$arch" in
               x86_64|aarch64)
                 cp "$d"/*.apk site/apk/stable/$arch/
