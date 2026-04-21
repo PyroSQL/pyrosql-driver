@@ -249,7 +249,7 @@ jobs:
 
               # Retag rpm with the track suffix before .rpm so the publish
               # job routes to the right pool (stable vs stable-legacy).
-              cd ffi-pwire/target/${{ matrix.target }}/generate-rpm
+              cd target/${{ matrix.target }}/generate-rpm
               for f in *.rpm; do
                 mv "$f" "${f%.rpm}.${{ matrix.track }}.rpm"
               done
@@ -259,7 +259,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: rpms-${{ matrix.track }}-${{ matrix.arch }}
-          path: ffi-pwire/target/${{ matrix.target }}/generate-rpm/*.rpm
+          path: target/${{ matrix.target }}/generate-rpm/*.rpm
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────────────────
