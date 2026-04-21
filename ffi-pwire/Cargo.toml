@@ -3,6 +3,9 @@ name = "pyrosql-ffi-pwire"
 version = "1.1.0"
 edition = "2021"
 description = "C-ABI shared library for PWire (raw TCP SQL client)"
+license = "MIT"
+repository = "https://github.com/pyrosql/pyrosql-driver"
+homepage = "https://pyrosql.com"
 
 [lib]
 crate-type = ["cdylib"]
@@ -10,3 +13,39 @@ crate-type = ["cdylib"]
 [dependencies]
 serde_json = "1"
 lz4_flex = "0.11"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Distribution packaging — CLIENT-ONLY (`pyrosql-driver`).
+#
+# This package is the PWire C-ABI shared library that apps link against to
+# talk to a PyroSQL server. It is CLIENT-side only — the server binary
+# (`pyrosql-server`) lives in a different repo and is NOT part of this
+# package.
+#
+# Produced by `cargo deb` / `cargo generate-rpm` in the Release workflow.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[package.metadata.deb]
+name = "pyrosql-driver"
+maintainer = "Una Partida Mas SRL <info@pyrosql.com>"
+copyright = "2025-2026 Una Partida Mas SRL"
+license-file = ["../LICENSE", "0"]
+extended-description = """
+PyroSQL client driver — C-ABI shared library (libpyrosql_ffi_pwire.so)
+that implements the PWire binary protocol. Link your application against
+this library to connect to a PyroSQL server. Does NOT include the server
+(install pyrosql-server for that, from a separate package)."""
+depends = "$auto"
+section = "libs"
+priority = "optional"
+assets = [
+    ["target/release/libpyrosql_ffi_pwire.so", "usr/lib/", "755"],
+]
+
+[package.metadata.generate-rpm]
+name = "pyrosql-driver"
+summary = "PyroSQL client driver — C-ABI shared library for the PWire protocol"
+license = "MIT"
+assets = [
+    { source = "target/release/libpyrosql_ffi_pwire.so", dest = "/usr/lib/libpyrosql_ffi_pwire.so", mode = "755" },
+]

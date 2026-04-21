@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   # ── Rust crates.io ──
@@ -97,10 +99,111 @@ jobs:
           packages-dir: dist/
     continue-on-error: true
 
-  # ── GitHub Release ──
+  # ─────────────────────────────────────────────────────────────────────────
+  # .deb for Debian / Ubuntu — amd64 + arm64. Payload = libpyrosql_ffi_pwire.so
+  # from the ffi-pwire crate. Package name = `pyrosql-driver`.
+  # ─────────────────────────────────────────────────────────────────────────
+  build-deb:
+    name: Build .deb (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deb-${{ matrix.target }}
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Install cargo-deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: Build cdylib
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
+          else
+            cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
+          fi
+      - name: Package .deb
+        run: cargo deb --manifest-path ffi-pwire/Cargo.toml --target ${{ matrix.target }} --no-build
+      - run: ls -la ffi-pwire/target/${{ matrix.target }}/debian/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.arch }}
+          path: ffi-pwire/target/${{ matrix.target }}/debian/*.deb
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # .rpm for Fedora / RHEL / Rocky / Alma — x86_64 + aarch64.
+  # ─────────────────────────────────────────────────────────────────────────
+  build-rpm:
+    name: Build .rpm (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rpm-${{ matrix.target }}
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Install cargo-generate-rpm
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-generate-rpm
+      - name: Build cdylib
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
+          else
+            cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
+          fi
+      - name: Package .rpm
+        run: cargo generate-rpm -p ffi-pwire --target ${{ matrix.target }} --payload-compress zstd
+      - run: find ffi-pwire/target -name '*.rpm' -type f
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpms-${{ matrix.arch }}
+          path: ffi-pwire/target/${{ matrix.target }}/generate-rpm/*.rpm
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # GitHub Release — bundles tarballs, Python wheel, .deb, .rpm as assets
+  # ─────────────────────────────────────────────────────────────────────────
   create-release:
     name: GitHub Release
-    needs: [build-ffi, build-python]
+    needs: [build-ffi, build-python, build-deb, build-rpm]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -124,8 +227,174 @@ jobs:
           name: python
           path: assets/
         continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: debs-*
+          merge-multiple: true
+          path: assets/
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rpms-*
+          merge-multiple: true
+          path: assets/
+        continue-on-error: true
       - run: ls -la assets/
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: assets/*
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Publish apt + yum repos to GitHub Pages — Tier 2 vendor-hosted repo
+  # without leaving GitHub. After this job, users install with:
+  #
+  #   curl -fsSL https://pyrosql.github.io/pyrosql-driver/gpg.key \
+  #       | sudo gpg --dearmor -o /usr/share/keyrings/pyrosql.gpg
+  #   echo "deb [signed-by=/usr/share/keyrings/pyrosql.gpg] https://pyrosql.github.io/pyrosql-driver/apt stable main" \
+  #       | sudo tee /etc/apt/sources.list.d/pyrosql.list
+  #   sudo apt update && sudo apt install pyrosql-driver
+  #
+  # One-time admin setup (see docs/packaging-tier2-setup.md):
+  #   - Secrets: GPG_PRIVATE_KEY, GPG_PASSPHRASE, GPG_KEY_ID.
+  #   - Settings → Pages → Source = Deploy from branch `gh-pages`.
+  # ─────────────────────────────────────────────────────────────────────────
+  publish-apt-yum:
+    name: Publish apt + yum repo
+    runs-on: ubuntu-latest
+    needs: [build-deb, build-rpm]
+    if: "!contains(github.ref, '-rc')"
+    steps:
+      - name: Checkout gh-pages (or create fresh)
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: site
+        continue-on-error: true
+
+      - name: Ensure gh-pages tree exists
+        run: |
+          mkdir -p site/apt/pool/main
+          mkdir -p site/apt/dists/stable/main/binary-amd64
+          mkdir -p site/apt/dists/stable/main/binary-arm64
+          mkdir -p site/yum/stable/x86_64
+          mkdir -p site/yum/stable/aarch64
+          [ -d site/.git ] || git -C site init -q --initial-branch=gh-pages
+
+      - name: Install apt + yum tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev apt-utils createrepo-c gpg
+
+      - name: Import release GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "::error::GPG_PRIVATE_KEY secret missing — see docs/packaging-tier2-setup.md"
+            exit 1
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --list-secret-keys --keyid-format LONG
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: debs-*
+          path: debs
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rpms-*
+          path: rpms
+          merge-multiple: true
+
+      - name: Copy .deb into pool
+        run: cp debs/*.deb site/apt/pool/main/
+
+      - name: Copy .rpm into per-arch pool
+        run: |
+          for f in rpms/*.rpm; do
+            case "$f" in
+              *x86_64.rpm)  cp "$f" site/yum/stable/x86_64/ ;;
+              *aarch64.rpm) cp "$f" site/yum/stable/aarch64/ ;;
+              *) echo "::warning::unknown rpm arch for $f" ;;
+            esac
+          done
+
+      - name: Regenerate apt metadata
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          cd site/apt
+          for arch in amd64 arm64; do
+            dpkg-scanpackages --arch $arch pool/ > dists/stable/main/binary-$arch/Packages
+            gzip -kf dists/stable/main/binary-$arch/Packages
+          done
+          cat > apt-release.conf <<EOF
+          APT::FTPArchive::Release::Origin "PyroSQL";
+          APT::FTPArchive::Release::Label "PyroSQL";
+          APT::FTPArchive::Release::Suite "stable";
+          APT::FTPArchive::Release::Codename "stable";
+          APT::FTPArchive::Release::Architectures "amd64 arm64";
+          APT::FTPArchive::Release::Components "main";
+          APT::FTPArchive::Release::Description "PyroSQL apt repository";
+          EOF
+          apt-ftparchive -c apt-release.conf release dists/stable > dists/stable/Release
+          echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --default-key "$GPG_KEY_ID" -abs -o dists/stable/Release.gpg dists/stable/Release
+          echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --default-key "$GPG_KEY_ID" --clearsign -o dists/stable/InRelease dists/stable/Release
+
+      - name: Regenerate yum repodata
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          for arch in x86_64 aarch64; do
+            dir=site/yum/stable/$arch
+            createrepo_c $dir
+            echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --default-key "$GPG_KEY_ID" --detach-sign --armor \
+              --output $dir/repodata/repomd.xml.asc $dir/repodata/repomd.xml
+          done
+
+      - name: Export public key
+        run: gpg --armor --export "${{ secrets.GPG_KEY_ID }}" > site/gpg.key
+
+      - name: Write index.html with install snippets
+        run: |
+          PAGES_URL="${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+          cat > site/index.html <<HTML
+          <!doctype html>
+          <title>PyroSQL driver package repository</title>
+          <h1>PyroSQL driver — Linux package repository</h1>
+          <p>Client-side driver only. For the server binary see the
+             <code>pyrosql-server</code> package distributed separately.</p>
+          <h2>Debian / Ubuntu</h2>
+          <pre>curl -fsSL https://${PAGES_URL}/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/pyrosql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pyrosql.gpg] https://${PAGES_URL}/apt stable main" | sudo tee /etc/apt/sources.list.d/pyrosql.list
+          sudo apt update
+          sudo apt install pyrosql-driver</pre>
+          <h2>Fedora / RHEL / Rocky / Alma</h2>
+          <pre>sudo tee /etc/yum.repos.d/pyrosql.repo <<EOF
+          [pyrosql]
+          name=PyroSQL
+          baseurl=https://${PAGES_URL}/yum/stable/\\\$basearch/
+          enabled=1
+          gpgcheck=1
+          gpgkey=https://${PAGES_URL}/gpg.key
+          EOF
+          sudo dnf install pyrosql-driver</pre>
+          HTML
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: site
+          force_orphan: false
+          commit_message: "repo: publish ${{ github.ref_name }} packages"
