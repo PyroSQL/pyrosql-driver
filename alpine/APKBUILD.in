@@ -1,0 +1,51 @@
+# Contributor: Una Partida Mas SRL <info@pyrosql.com>
+# Maintainer:  Una Partida Mas SRL <info@pyrosql.com>
+#
+# This is a TEMPLATE. The release workflow substitutes @PKGVER@ with the
+# workspace version from Cargo.toml and drops the resulting file next to
+# the pre-built cdylib inside the container, so `abuild -r` can pick it
+# up. Keeping the APKBUILD template in-repo (instead of generating the
+# whole file from scratch in YAML) keeps the metadata declarative +
+# reviewable in `git diff`.
+#
+# Payload = libpyrosql_ffi_pwire.so from the ffi-pwire sub-crate, built
+# ahead of time with `cargo build --release --target <musl-triple>`.
+# We do NOT let abuild run `cargo build` itself: Alpine CI containers
+# don't have the private-repo token plumbing, and duplicating the
+# manylinux-style "docker run + git config insteadOf" dance inside
+# abuild's sandboxed build() would be fragile. Pre-building on the
+# runner side is the same pattern the .deb flow uses (cargo-deb
+# --no-build + pre-baked .so).
+pkgname=pyrosql-driver
+pkgver=@PKGVER@
+pkgrel=0
+pkgdesc="PyroSQL client driver — C-ABI shared library (PWire protocol)"
+url="https://pyrosql.com"
+arch="x86_64 aarch64"
+license="MIT"
+depends=""
+# No makedepends — the .so is pre-built on the runner.
+makedepends=""
+# `source` lists files relative to $startdir; the workflow places the
+# pre-built .so and the LICENSE next to this APKBUILD before invoking
+# `abuild -r`.
+source="libpyrosql_ffi_pwire.so
+	LICENSE
+	"
+# Skip checksum on the pre-built .so — it's produced in the same CI
+# run, not fetched. Keeping `sha512sums` empty would make abuild refuse
+# to build; use `SKIP` so the file is still staged into $srcdir but
+# without a fixed hash.
+options="!check"
+
+# No unpack/prepare/build — everything is pre-built.
+build() {
+	:
+}
+
+package() {
+	install -Dm755 "$srcdir"/libpyrosql_ffi_pwire.so \
+		"$pkgdir"/usr/lib/libpyrosql_ffi_pwire.so
+	install -Dm644 "$srcdir"/LICENSE \
+		"$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+}

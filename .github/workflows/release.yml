@@ -243,11 +243,182 @@ jobs:
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────────────────
+  # .apk for Alpine Linux — SINGLE TRACK. Alpine uses musl libc (not glibc)
+  # so the .deb/.rpm dual-track strategy doesn't apply here: we build one
+  # `x86_64-unknown-linux-musl` (+ aarch64 equivalent) artifact on a
+  # mid-range Alpine (3.19 / musl 1.2.4) and call it a day. If legacy
+  # Alpine 3.13 ever matters we can add a second track later.
+  #
+  # Signing uses Alpine's own scheme (RSA key + abuild-sign) — completely
+  # separate from the GPG key used for apt/yum. The public key is checked
+  # into .github/alpine-signing/ (visible to everyone, that's fine —
+  # pubkey only). The private key is the `ALPINE_SIGNING_PRIVATE_KEY`
+  # secret; if it's missing we emit a ::warning:: + skip the apk build,
+  # mirroring the soft-failure behaviour the publish job expects for
+  # optional artefacts.
+  # ─────────────────────────────────────────────────────────────────────────
+  build-apk:
+    name: Build .apk (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  target: x86_64-unknown-linux-musl,  runner: ubuntu-latest    }
+          - { arch: aarch64, target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Alpine signing key secret
+        id: check_key
+        env:
+          ALPINE_SIGNING_PRIVATE_KEY: ${{ secrets.ALPINE_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$ALPINE_SIGNING_PRIVATE_KEY" ]; then
+            echo "::warning::ALPINE_SIGNING_PRIVATE_KEY secret missing — skipping .apk build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure git to fetch pyro-runtime via token
+        if: steps.check_key.outputs.skip != 'true'
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
+        run: |
+          if [ -z "$PYROSQL_REPO_TOKEN" ]; then
+            echo "::error::PYROSQL_REPO_TOKEN secret missing — cannot resolve private pyro-runtime dep."
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Extract workspace version
+        if: steps.check_key.outputs.skip != 'true'
+        id: ver
+        run: |
+          # Match the top-level workspace.package.version = "x.y.z" line
+          # (NOT a nested dep). The Cargo.toml here puts it right under
+          # [workspace.package] so a simple grep is enough.
+          v=$(grep -E '^\s*version\s*=' Cargo.toml | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "pkgver=$v" >> "$GITHUB_OUTPUT"
+          echo "Detected workspace version: $v"
+
+      - name: Build .apk inside alpine:3.19
+        if: steps.check_key.outputs.skip != 'true'
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
+          ALPINE_SIGNING_PRIVATE_KEY: ${{ secrets.ALPINE_SIGNING_PRIVATE_KEY }}
+          PKGVER: ${{ steps.ver.outputs.pkgver }}
+          RUST_TARGET: ${{ matrix.target }}
+          APK_ARCH: ${{ matrix.arch }}
+        run: |
+          # Stage the privkey on the host so we can mount it read-only
+          # into the container. Passing it via -e would leak into `ps`.
+          mkdir -p /tmp/alpine-keys
+          printf '%s' "$ALPINE_SIGNING_PRIVATE_KEY" > /tmp/alpine-keys/info-pyrosql-com.rsa
+          chmod 600 /tmp/alpine-keys/info-pyrosql-com.rsa
+          # Copy the in-repo pubkey alongside — abuild needs BOTH (the
+          # privkey signs, the pubkey goes into /etc/apk/keys of the
+          # build sandbox so the signed index round-trip verifies).
+          cp .github/alpine-signing/info-pyrosql-com.rsa.pub /tmp/alpine-keys/
+
+          mkdir -p /tmp/apk-out
+
+          docker run --rm \
+            -v "${{ github.workspace }}:/src:ro" \
+            -v /tmp/alpine-keys:/keys:ro \
+            -v /tmp/apk-out:/out \
+            -e PYROSQL_REPO_TOKEN="$PYROSQL_REPO_TOKEN" \
+            -e PKGVER="$PKGVER" \
+            -e RUST_TARGET="$RUST_TARGET" \
+            -e APK_ARCH="$APK_ARCH" \
+            -e CARGO_TERM_COLOR=always \
+            alpine:3.19 \
+            sh -euxc '
+              # alpine-sdk gives us abuild + abuild-sign + abuild-keygen
+              # musl-dev / gcc are already in alpine-sdk.
+              apk add --no-cache alpine-sdk sudo openssl curl git bash coreutils
+
+              # rustup so we control the toolchain + can add the musl target.
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain 1.94.1 --profile minimal --target "$RUST_TARGET"
+              . "$HOME/.cargo/env"
+
+              git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+              # Copy the source tree out of the read-only mount so cargo
+              # can write into target/ without fighting RO permissions.
+              cp -a /src /build
+              cd /build
+
+              # Build the cdylib against musl. Link openssl statically via
+              # vendored feature? -- not needed: the ffi-pwire crate has
+              # no openssl dep (see Cargo.toml).
+              cargo build --manifest-path ffi-pwire/Cargo.toml --release --target "$RUST_TARGET"
+
+              # Create a non-root user for abuild (abuild refuses to run
+              # as root, which is a safety feature we respect).
+              adduser -D -G abuild builder
+              echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+              # Give the builder its own APKBUILD dir. We materialise the
+              # .in template with the workspace version substituted.
+              mkdir -p /home/builder/pkg
+              sed "s/@PKGVER@/${PKGVER}/g" alpine/APKBUILD.in > /home/builder/pkg/APKBUILD
+              cp "ffi-pwire/target/${RUST_TARGET}/release/libpyrosql_ffi_pwire.so" /home/builder/pkg/
+              cp LICENSE /home/builder/pkg/
+              chown -R builder:abuild /home/builder
+
+              # Install the signing keys where abuild looks for them:
+              #   ~/.abuild/abuild.conf -> PACKAGER_PRIVKEY=/path/to/key
+              #   /etc/apk/keys/<name>.rsa.pub -> used to verify signed indices
+              su builder -c "mkdir -p /home/builder/.abuild"
+              cp /keys/info-pyrosql-com.rsa  /home/builder/.abuild/info-pyrosql-com.rsa
+              cp /keys/info-pyrosql-com.rsa.pub /home/builder/.abuild/info-pyrosql-com.rsa.pub
+              chown builder:abuild /home/builder/.abuild/info-pyrosql-com.rsa*
+              chmod 600 /home/builder/.abuild/info-pyrosql-com.rsa
+              printf "PACKAGER_PRIVKEY=/home/builder/.abuild/info-pyrosql-com.rsa\n" \
+                > /home/builder/.abuild/abuild.conf
+              chown builder:abuild /home/builder/.abuild/abuild.conf
+
+              # abuild wants the pubkey in /etc/apk/keys too, so the
+              # final APKINDEX signature round-trips locally.
+              cp /keys/info-pyrosql-com.rsa.pub /etc/apk/keys/
+
+              # Generate checksums and build.
+              cd /home/builder/pkg
+              su builder -c "cd /home/builder/pkg && abuild checksum"
+              # -r = install makedepends (there are none, but the flag
+              # also triggers the full build+package pipeline).
+              # -P = destination repo root (we do NOT use it; abuild
+              # writes to ~/packages/<repo-name>/<arch>/ by default).
+              su builder -c "cd /home/builder/pkg && abuild -r"
+
+              # Collect the produced .apk. abuild puts it under
+              #   ~/packages/<dirname-of-APKBUILD-parent>/<arch>/<name>-<ver>-r<rel>.apk
+              # The parent dir of /home/builder/pkg is "builder", so:
+              mkdir -p /out
+              find /home/builder/packages -name "*.apk" -print -exec cp {} /out/ \;
+              ls -la /out/
+            '
+
+          ls -la /tmp/apk-out/
+          mkdir -p dist
+          cp /tmp/apk-out/*.apk dist/
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check_key.outputs.skip != 'true'
+        with:
+          name: apks-${{ matrix.arch }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────
   # GitHub Release — bundles tarballs, Python wheel, .deb, .rpm as assets
   # ─────────────────────────────────────────────────────────────────────────
   create-release:
     name: GitHub Release
-    needs: [build-ffi, build-python, build-deb, build-rpm]
+    needs: [build-ffi, build-python, build-deb, build-rpm, build-apk]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -283,6 +454,12 @@ jobs:
           merge-multiple: true
           path: assets/
         continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: apks-*
+          merge-multiple: true
+          path: assets/
+        continue-on-error: true
       - run: ls -la assets/
       - uses: softprops/action-gh-release@v2
         with:
@@ -304,9 +481,9 @@ jobs:
   #   - Settings → Pages → Source = Deploy from branch `gh-pages`.
   # ─────────────────────────────────────────────────────────────────────────
   publish-apt-yum:
-    name: Publish apt + yum repo
+    name: Publish apt + yum + apk repo
     runs-on: ubuntu-latest
-    needs: [build-deb, build-rpm]
+    needs: [build-deb, build-rpm, build-apk]
     if: "!contains(github.ref, '-rc')"
     steps:
       # Check out `main` at the workflow root — gives us tools/gen_install_page.py
@@ -332,6 +509,9 @@ jobs:
             mkdir -p site/yum/$track/x86_64
             mkdir -p site/yum/$track/aarch64
           done
+          # Alpine .apk repo — SINGLE TRACK only (see build-apk comment).
+          mkdir -p site/apk/stable/x86_64
+          mkdir -p site/apk/stable/aarch64
           [ -d site/.git ] || git -C site init -q --initial-branch=gh-pages
 
       - name: Install apt + yum tooling
@@ -366,6 +546,17 @@ jobs:
           pattern: rpms-*
           path: rpms
           merge-multiple: false
+
+      # .apk artefacts are optional: if ALPINE_SIGNING_PRIVATE_KEY
+      # wasn't set, the build-apk job emits a warning + skips, and no
+      # `apks-*` artefacts exist. continue-on-error keeps the rest of
+      # publish working (apt + yum remain fully functional alone).
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: apks-*
+          path: apks
+          merge-multiple: false
+        continue-on-error: true
 
       - name: Route .deb into per-track pool
         run: |
@@ -409,6 +600,28 @@ jobs:
             esac
           done
           find site/yum -name '*.rpm' -print
+
+      - name: Route .apk into per-arch pool (single track)
+        # Only runs if the build-apk job produced artefacts. If the
+        # signing secret was missing, `apks/` is empty and this step
+        # becomes a no-op.
+        run: |
+          if [ ! -d apks ] || [ -z "$(ls apks 2>/dev/null)" ]; then
+            echo "::notice::no .apk artefacts present (signing key not configured); skipping apk routing."
+            exit 0
+          fi
+          for d in apks/apks-*; do
+            [ -d "$d" ] || continue
+            base=$(basename "$d")            # e.g. apks-x86_64 or apks-aarch64
+            arch=${base#apks-}
+            case "$arch" in
+              x86_64|aarch64)
+                cp "$d"/*.apk site/apk/stable/$arch/
+                ;;
+              *) echo "::warning::unknown arch ($arch) in artifact $base" ;;
+            esac
+          done
+          find site/apk -name '*.apk' -print
 
       - name: Regenerate apt metadata (per track)
         env:
@@ -457,6 +670,71 @@ jobs:
                 --output $dir/repodata/repomd.xml.asc $dir/repodata/repomd.xml
             done
           done
+
+      - name: Generate + sign APKINDEX (per-arch, single track)
+        # Runs inside alpine:3.19 to get apk-tools + abuild-sign from
+        # the distro where they're first-class. The privkey is mounted
+        # read-only from /tmp/alpine-keys/ (written earlier if the
+        # build-apk job ran — otherwise the step is a no-op).
+        env:
+          ALPINE_SIGNING_PRIVATE_KEY: ${{ secrets.ALPINE_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$ALPINE_SIGNING_PRIVATE_KEY" ]; then
+            echo "::notice::ALPINE_SIGNING_PRIVATE_KEY missing — skipping apk index generation."
+            exit 0
+          fi
+          # No apks routed → nothing to index.
+          if [ -z "$(find site/apk -name '*.apk' -print -quit 2>/dev/null)" ]; then
+            echo "::notice::no .apk files in site/apk — skipping index generation."
+            exit 0
+          fi
+
+          mkdir -p /tmp/alpine-keys-publish
+          printf '%s' "$ALPINE_SIGNING_PRIVATE_KEY" > /tmp/alpine-keys-publish/info-pyrosql-com.rsa
+          chmod 600 /tmp/alpine-keys-publish/info-pyrosql-com.rsa
+          cp .github/alpine-signing/info-pyrosql-com.rsa.pub /tmp/alpine-keys-publish/
+
+          docker run --rm \
+            -v "${{ github.workspace }}/site/apk:/apk" \
+            -v /tmp/alpine-keys-publish:/keys:ro \
+            alpine:3.19 \
+            sh -euxc '
+              apk add --no-cache alpine-sdk
+              cp /keys/info-pyrosql-com.rsa.pub /etc/apk/keys/
+              mkdir -p /root/.abuild
+              cp /keys/info-pyrosql-com.rsa     /root/.abuild/info-pyrosql-com.rsa
+              cp /keys/info-pyrosql-com.rsa.pub /root/.abuild/info-pyrosql-com.rsa.pub
+              chmod 600 /root/.abuild/info-pyrosql-com.rsa
+              printf "PACKAGER_PRIVKEY=/root/.abuild/info-pyrosql-com.rsa\n" \
+                > /root/.abuild/abuild.conf
+
+              for arch in x86_64 aarch64; do
+                dir="/apk/stable/$arch"
+                if [ ! -d "$dir" ] || [ -z "$(ls "$dir"/*.apk 2>/dev/null)" ]; then
+                  echo "no apks in $dir — skipping"
+                  continue
+                fi
+                cd "$dir"
+                # `apk index` builds the APKINDEX.tar.gz describing every
+                # .apk in the directory. -o = output path. --rewrite-arch
+                # keeps the filename-derived arch in the index (matches
+                # the per-dir layout we committed to).
+                apk index -o APKINDEX.tar.gz --rewrite-arch "$arch" *.apk
+                # abuild-sign appends the detached RSA signature inside
+                # the tar itself (that is how Alpine expects it — not a
+                # separate .sig file).
+                abuild-sign -k /root/.abuild/info-pyrosql-com.rsa APKINDEX.tar.gz
+                ls -la .
+                cd -
+              done
+            '
+
+      - name: Export Alpine public key
+        run: |
+          # User-visible pubkey fetched by `wget -O /etc/apk/keys/...`
+          # from the install snippet. Always copied even when no apks
+          # got built this run, so the URL stays stable across releases.
+          cp .github/alpine-signing/info-pyrosql-com.rsa.pub site/apk/info-pyrosql-com.rsa.pub
 
       - name: Export public key
         run: gpg --armor --export "${{ secrets.GPG_KEY_ID }}" > site/gpg.key

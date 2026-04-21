@@ -22,7 +22,7 @@ html = f"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Install PyroSQL driver · apt / dnf / zypper</title>
+<title>Install PyroSQL driver · apt / dnf / zypper / apk</title>
 <style>
   :root {{ --fg:#1a1a1a; --muted:#6b6b6b; --bg:#fff; --accent:#ff5a1f; --code-bg:#f4f4f4; --border:#e5e5e5; }}
   * {{ box-sizing:border-box; }}
@@ -105,6 +105,13 @@ sudo yum install pyrosql-driver</code></pre>
 sudo rpm --import https://{url}/gpg.key
 sudo zypper install pyrosql-driver</code></pre>
 
+<h2>Alpine Linux</h2>
+<p>Alpine uses musl libc, so it gets its own build + its own RSA signing scheme (separate from the apt/yum GPG key). One track only &mdash; the <code>stable</code> repo is built against Alpine 3.19 (musl 1.2.4) and runs on any Alpine 3.17+.</p>
+<pre><code>sudo wget -O /etc/apk/keys/info-pyrosql-com.rsa.pub https://{url}/apk/info-pyrosql-com.rsa.pub
+echo "https://{url}/apk/stable" | sudo tee -a /etc/apk/repositories
+sudo apk update
+sudo apk add pyrosql-driver</code></pre>
+
 <h2>Other languages &middot; other platforms</h2>
 
 <table>
@@ -123,7 +130,7 @@ ldconfig -p | grep pyrosql
 # -> libpyrosql_ffi_pwire.so (libc6,x86-64) =&gt; /usr/lib/x86_64-linux-gnu/libpyrosql_ffi_pwire.so
 
 # Check the package version
-apt show pyrosql-driver 2&gt;/dev/null || rpm -qi pyrosql-driver</code></pre>
+apt show pyrosql-driver 2&gt;/dev/null || rpm -qi pyrosql-driver 2&gt;/dev/null || apk info -v pyrosql-driver</code></pre>
 
 <h2>Troubleshooting</h2>
 
@@ -143,7 +150,12 @@ sudo rm /etc/apt/sources.list.d/pyrosql.list /usr/share/keyrings/pyrosql.gpg
 
 # RHEL / Fedora
 sudo dnf remove pyrosql-driver
-sudo rm /etc/yum.repos.d/pyrosql.repo</code></pre>
+sudo rm /etc/yum.repos.d/pyrosql.repo
+
+# Alpine
+sudo apk del pyrosql-driver
+sudo sed -i '/pyrosql-driver\\/apk\\/stable/d' /etc/apk/repositories
+sudo rm /etc/apk/keys/info-pyrosql-com.rsa.pub</code></pre>
 
 <footer>
   PyroSQL driver &middot; MIT licensed &middot; <a href="https://github.com/{repo}">source on GitHub</a>
