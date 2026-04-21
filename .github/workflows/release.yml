@@ -121,51 +121,78 @@ jobs:
   #                    box. Same code, same perf — different linking floor.
   build-deb:
     name: Build .deb (${{ matrix.track }}/${{ matrix.arch }})
-    runs-on: ubuntu-latest
-    container: ${{ matrix.container }}
+    # Native runners per arch — no QEMU, no cross-compile.
+    # `ubuntu-24.04-arm` is GitHub's free-tier ARM runner (GA 2025-01).
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { track: stable,        arch: amd64, target: x86_64-unknown-linux-gnu,  container: "quay.io/pypa/manylinux_2_28_x86_64" }
-          - { track: stable,        arch: arm64, target: aarch64-unknown-linux-gnu, container: "quay.io/pypa/manylinux_2_28_aarch64" }
-          - { track: stable-legacy, arch: amd64, target: x86_64-unknown-linux-gnu,  container: "quay.io/pypa/manylinux2014_x86_64" }
-          - { track: stable-legacy, arch: arm64, target: aarch64-unknown-linux-gnu, container: "quay.io/pypa/manylinux2014_aarch64" }
+          - { track: stable,        arch: amd64, target: x86_64-unknown-linux-gnu,  runner: ubuntu-latest,    container: "quay.io/pypa/manylinux_2_28_x86_64" }
+          - { track: stable,        arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux_2_28_aarch64" }
+          - { track: stable-legacy, arch: amd64, target: x86_64-unknown-linux-gnu,  runner: ubuntu-latest,    container: "quay.io/pypa/manylinux2014_x86_64" }
+          - { track: stable-legacy, arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux2014_aarch64" }
     steps:
+      # Checkout happens on the HOST (modern glibc on the Ubuntu runner),
+      # not inside the container — manylinux2014's glibc 2.17 is too old
+      # for Node 20 (which actions/checkout@v4 needs).
       - uses: actions/checkout@v4
 
-      # manylinux images are CentOS-based → yum/dnf, not apt. They also
-      # lack Rust + cargo-deb out of the box; install both inside.
-      - name: Install Rust toolchain in container
-        shell: bash
+      - name: Configure git to fetch pyro-runtime via token
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.94.1 --profile minimal --target ${{ matrix.target }}
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          if [ -z "$PYROSQL_REPO_TOKEN" ]; then
+            echo "::error::PYROSQL_REPO_TOKEN secret missing — cannot resolve private pyro-runtime dep."
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
 
-      - name: Install dpkg-dev + cargo-deb
-        shell: bash
+      # Build the .deb inside the manylinux container via explicit `docker run`.
+      # Mounting the checked-out tree + the host's git credentials lets us
+      # reuse the host-side checkout, so we never invoke `actions/checkout`
+      # inside the ancient-glibc environment.
+      - name: Build inside manylinux container
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
         run: |
-          # cargo-deb is a Rust binary; install via cargo. dpkg-dev is
-          # needed by cargo-deb internally for Packages index diffs, etc.
-          yum install -y dpkg dpkg-dev 2>/dev/null || true
-          $HOME/.cargo/bin/cargo install cargo-deb --locked
+          docker run --rm \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            -e PYROSQL_REPO_TOKEN="$PYROSQL_REPO_TOKEN" \
+            -e CARGO_TERM_COLOR=always \
+            ${{ matrix.container }} \
+            bash -euxc '
+              # Install Rust (matches workspace toolchain).
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain 1.94.1 --profile minimal --target ${{ matrix.target }}
+              export PATH="$HOME/.cargo/bin:$PATH"
 
-      - name: Build cdylib
-        shell: bash
-        run: cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
+              # Inside-container git token for the private pyro-runtime dep.
+              git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
 
-      - name: Package .deb (retag with track suffix)
-        shell: bash
-        run: |
-          cargo deb --manifest-path ffi-pwire/Cargo.toml --target ${{ matrix.target }} --no-build
-          # cargo-deb names the file pyrosql-driver_<ver>_<arch>.deb — rename to
-          # include the track so the publish job routes it correctly.
-          cd ffi-pwire/target/${{ matrix.target }}/debian
-          for f in *.deb; do
-            mv "$f" "${f%.deb}_${{ matrix.track }}.deb"
-          done
-          ls -la
+              # dpkg + dpkg-dev — manylinux is CentOS-based and has no apt,
+              # so we install dpkg from EPEL (stable) or rpm fallback.
+              yum install -y dpkg dpkg-dev 2>/dev/null || \
+                dnf install -y dpkg dpkg-dev 2>/dev/null || \
+                true
+
+              # cargo-deb provides the packaging pipeline; installing
+              # --locked pins to the Cargo.lock from the tool itself.
+              cargo install cargo-deb --locked
+
+              # Actual build + packaging.
+              cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
+              cargo deb --manifest-path ffi-pwire/Cargo.toml --target ${{ matrix.target }} --no-build
+
+              # Tag the filename with the track (stable / stable-legacy) so
+              # the publish job can route it into the right pool.
+              cd ffi-pwire/target/${{ matrix.target }}/debian
+              for f in *.deb; do
+                mv "$f" "${f%.deb}_${{ matrix.track }}.deb"
+              done
+              ls -la
+            '
 
       - uses: actions/upload-artifact@v4
         with:
@@ -176,46 +203,62 @@ jobs:
   # .rpm for Fedora / RHEL / Rocky / Alma — same dual-track strategy.
   build-rpm:
     name: Build .rpm (${{ matrix.track }}/${{ matrix.arch }})
-    runs-on: ubuntu-latest
-    container: ${{ matrix.container }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { track: stable,        arch: x86_64,  target: x86_64-unknown-linux-gnu,  container: "quay.io/pypa/manylinux_2_28_x86_64" }
-          - { track: stable,        arch: aarch64, target: aarch64-unknown-linux-gnu, container: "quay.io/pypa/manylinux_2_28_aarch64" }
-          - { track: stable-legacy, arch: x86_64,  target: x86_64-unknown-linux-gnu,  container: "quay.io/pypa/manylinux2014_x86_64" }
-          - { track: stable-legacy, arch: aarch64, target: aarch64-unknown-linux-gnu, container: "quay.io/pypa/manylinux2014_aarch64" }
+          - { track: stable,        arch: x86_64,  target: x86_64-unknown-linux-gnu,  runner: ubuntu-latest,    container: "quay.io/pypa/manylinux_2_28_x86_64" }
+          - { track: stable,        arch: aarch64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux_2_28_aarch64" }
+          - { track: stable-legacy, arch: x86_64,  target: x86_64-unknown-linux-gnu,  runner: ubuntu-latest,    container: "quay.io/pypa/manylinux2014_x86_64" }
+          - { track: stable-legacy, arch: aarch64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux2014_aarch64" }
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain in container
-        shell: bash
+      - name: Configure git to fetch pyro-runtime via token
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.94.1 --profile minimal --target ${{ matrix.target }}
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          if [ -z "$PYROSQL_REPO_TOKEN" ]; then
+            echo "::error::PYROSQL_REPO_TOKEN secret missing — cannot resolve private pyro-runtime dep."
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
 
-      - name: Install cargo-generate-rpm
-        shell: bash
-        run: $HOME/.cargo/bin/cargo install cargo-generate-rpm --locked
-
-      - name: Build cdylib
-        shell: bash
-        run: cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
-
-      - name: Package .rpm (retag with track suffix)
-        shell: bash
+      - name: Build inside manylinux container
+        env:
+          PYROSQL_REPO_TOKEN: ${{ secrets.PYROSQL_REPO_TOKEN }}
         run: |
-          cargo generate-rpm -p ffi-pwire --target ${{ matrix.target }} --payload-compress zstd
-          cd ffi-pwire/target/${{ matrix.target }}/generate-rpm
-          for f in *.rpm; do
-            mv "$f" "${f%.rpm}.${{ matrix.track }}.rpm"
-          done
-          ls -la
+          docker run --rm \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            -e PYROSQL_REPO_TOKEN="$PYROSQL_REPO_TOKEN" \
+            -e CARGO_TERM_COLOR=always \
+            ${{ matrix.container }} \
+            bash -euxc '
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain 1.94.1 --profile minimal --target ${{ matrix.target }}
+              export PATH="$HOME/.cargo/bin:$PATH"
+
+              git config --global url."https://x-access-token:${PYROSQL_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+              cargo install cargo-generate-rpm --locked
+
+              cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
+              cargo generate-rpm -p ffi-pwire --target ${{ matrix.target }} --payload-compress zstd
+
+              # Retag rpm with the track suffix before .rpm so the publish
+              # job routes to the right pool (stable vs stable-legacy).
+              cd ffi-pwire/target/${{ matrix.target }}/generate-rpm
+              for f in *.rpm; do
+                mv "$f" "${f%.rpm}.${{ matrix.track }}.rpm"
+              done
+              ls -la
+            '
+
       - uses: actions/upload-artifact@v4
         with:
-          name: rpms-${{ matrix.arch }}
+          name: rpms-${{ matrix.track }}-${{ matrix.arch }}
           path: ffi-pwire/target/${{ matrix.target }}/generate-rpm/*.rpm
           if-no-files-found: error
 
