@@ -1,0 +1,51 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Architectures: amd64 arm64
+Codename: stable
+Components: main
+Date: Tue, 21 Apr 2026 17:18:42 +0000
+Description: PyroSQL apt repository (stable-legacy)
+Label: PyroSQL-stable-legacy
+Origin: PyroSQL
+Suite: stable
+MD5Sum:
+ 35960fbf017295fa6f3ba7de0f452735              210 Release
+ d41d8cd98f00b204e9800998ecf8427e                0 main/binary-amd64/Packages
+ e943ff7c82b2b6fccdc25eef2bf44d22               29 main/binary-amd64/Packages.gz
+ d41d8cd98f00b204e9800998ecf8427e                0 main/binary-arm64/Packages
+ e943ff7c82b2b6fccdc25eef2bf44d22               29 main/binary-arm64/Packages.gz
+SHA1:
+ c1411731278de120e583a13e19adfb8790ebc8ad              210 Release
+ da39a3ee5e6b4b0d3255bfef95601890afd80709                0 main/binary-amd64/Packages
+ 0a6ef560403706c472ca298a2ed8fe3bff91ea64               29 main/binary-amd64/Packages.gz
+ da39a3ee5e6b4b0d3255bfef95601890afd80709                0 main/binary-arm64/Packages
+ 0a6ef560403706c472ca298a2ed8fe3bff91ea64               29 main/binary-arm64/Packages.gz
+SHA256:
+ 323356b5777452bbd3fe03cf71f3e2b4ccbebd1f4194ec77a6a7f7371e0ccced              210 Release
+ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855                0 main/binary-amd64/Packages
+ f6ea047035aa574ba1aaa559a5d041d75a2e9ff848b751c0b6fa3f55108211fc               29 main/binary-amd64/Packages.gz
+ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855                0 main/binary-arm64/Packages
+ f6ea047035aa574ba1aaa559a5d041d75a2e9ff848b751c0b6fa3f55108211fc               29 main/binary-arm64/Packages.gz
+SHA512:
+ 6c995935cb1cb26d769d5646e69cbf6ba3b35650224a8171a99b6ee1bf5f4e0d548950564023bc94f25a0b15ef1f30b6e0b2823131b2c3b40f77ac92519df6f2              210 Release
+ cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e                0 main/binary-amd64/Packages
+ 244b44b035bc073b14573299a56de02abc0ddd261a85c813c5f49d9f856c63c56f0def0e8dbf4197b94f1f948155a3bb02bfbe7122dccc37e53ac3a479401434               29 main/binary-amd64/Packages.gz
+ cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e                0 main/binary-arm64/Packages
+ 244b44b035bc073b14573299a56de02abc0ddd261a85c813c5f49d9f856c63c56f0def0e8dbf4197b94f1f948155a3bb02bfbe7122dccc37e53ac3a479401434               29 main/binary-arm64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEE6AnT2CbnNroXrtMjYq8gDW0sFp4FAmnnsXIACgkQYq8gDW0s
+Fp5p5xAAoLVfnq3cSXR3HIbajdW5xFRILimSaLhptEqMBXL4CchfQqUaeHgpLydv
+3uLts7cM1au+kVp+6WoCnYvCvhILDVSBB4yd3JCs/TvY8Fpm7buRDSTT/v84n7Bm
+HmN7yYplQDlHymuPa1CQ3lUkx0omC9Aivv9x65StArsX2w0b2RNvqWBVwqS2g8Mp
+w8M99/XHtbK2+oCpnISszC8bDoOpjD7oC0Q2RxkDznjwwCcZDq9nNuGs0QFLEUf1
+zkqzoGnQiHb/TREcJ8CWRFn+sCVS/NCMb3eMoIWllQ9TsCFucRbQdxMURe7f62Yg
+4+WalpWCI/+K2vTLPCHN6+Y1PnAYzRQ3PG/fWQ3XeK+br09ZNcO/rgHKjn1I1jTx
+fL5JWsxAVGNdvny/+U/NOl0xrjrcLAZCEatOyPllYH8s3IW8M+NfeRuP1IGCb+co
+dHVE2L5PYcNzaM1m8+yo+zLMqoa3mWK8X3B2Xf1/XMI2h01x6l6VtXoLBZpxcxqO
+DBsUn8H+a5H9hYLrJ8hIycAhygZkN+UwEZ+KO701m9uZIzoCfRGf7d7BsjMG3bN3
+lZPeZs7SqU9eETNOY+d34X83jpAqJgKulSTyvy/lE1pZO7SiopsCH/2AObPdNfhg
+OuhSrpsJLx0RGMEW8kDR0L+O/unXxpFgsawTjwWbZ1IYic9OT10=
+=2uhV
+-----END PGP SIGNATURE-----

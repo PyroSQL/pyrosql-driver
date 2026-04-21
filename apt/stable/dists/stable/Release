@@ -1,0 +1,32 @@
+Architectures: amd64 arm64
+Codename: stable
+Components: main
+Date: Tue, 21 Apr 2026 17:18:42 +0000
+Description: PyroSQL apt repository (stable)
+Label: PyroSQL-stable
+Origin: PyroSQL
+Suite: stable
+MD5Sum:
+ f4671e81f90e8f8e5549c0f8d11eaf3e              196 Release
+ d41d8cd98f00b204e9800998ecf8427e                0 main/binary-amd64/Packages
+ e943ff7c82b2b6fccdc25eef2bf44d22               29 main/binary-amd64/Packages.gz
+ d41d8cd98f00b204e9800998ecf8427e                0 main/binary-arm64/Packages
+ e943ff7c82b2b6fccdc25eef2bf44d22               29 main/binary-arm64/Packages.gz
+SHA1:
+ 6016d1cd30f3db0fae93417862618c5fedce78b7              196 Release
+ da39a3ee5e6b4b0d3255bfef95601890afd80709                0 main/binary-amd64/Packages
+ 0a6ef560403706c472ca298a2ed8fe3bff91ea64               29 main/binary-amd64/Packages.gz
+ da39a3ee5e6b4b0d3255bfef95601890afd80709                0 main/binary-arm64/Packages
+ 0a6ef560403706c472ca298a2ed8fe3bff91ea64               29 main/binary-arm64/Packages.gz
+SHA256:
+ 7965e5e58464a6948817f8d990fc34de7f8cc0055e4c98c91874500f2d48db8c              196 Release
+ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855                0 main/binary-amd64/Packages
+ f6ea047035aa574ba1aaa559a5d041d75a2e9ff848b751c0b6fa3f55108211fc               29 main/binary-amd64/Packages.gz
+ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855                0 main/binary-arm64/Packages
+ f6ea047035aa574ba1aaa559a5d041d75a2e9ff848b751c0b6fa3f55108211fc               29 main/binary-arm64/Packages.gz
+SHA512:
+ aef7a83fb1235096ceacd3df75eb5e4cea21b6ec528d2f078eec638f8d1e17171f04f6de850d5d689476be561d74485247d4827e6af4cb5f282c3f3c73d2e390              196 Release
+ cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e                0 main/binary-amd64/Packages
+ 244b44b035bc073b14573299a56de02abc0ddd261a85c813c5f49d9f856c63c56f0def0e8dbf4197b94f1f948155a3bb02bfbe7122dccc37e53ac3a479401434               29 main/binary-amd64/Packages.gz
+ cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e                0 main/binary-arm64/Packages
+ 244b44b035bc073b14573299a56de02abc0ddd261a85c813c5f49d9f856c63c56f0def0e8dbf4197b94f1f948155a3bb02bfbe7122dccc37e53ac3a479401434               29 main/binary-arm64/Packages.gz
