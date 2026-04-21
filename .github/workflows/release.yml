@@ -312,6 +312,12 @@ jobs:
     needs: [build-deb, build-rpm]
     if: "!contains(github.ref, '-rc')"
     steps:
+      # Check out `main` at the workflow root — gives us tools/gen_install_page.py
+      # for the install page template.  Must run BEFORE the gh-pages checkout
+      # so the default path (repo root) is main.
+      - name: Checkout main
+        uses: actions/checkout@v4
+
       - name: Checkout gh-pages (or create fresh)
         uses: actions/checkout@v4
         with:
