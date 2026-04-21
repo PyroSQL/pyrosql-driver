@@ -13,11 +13,13 @@
 #![deny(unsafe_code)]
 
 mod args;
+mod complete;
 mod format;
 mod meta;
 mod repl;
 mod session;
 mod sqltok;
+mod vars;
 
 use std::process::ExitCode;
 
@@ -37,6 +39,16 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
+    // Completion-script generator: prints and exits BEFORE any
+    // connection attempt, so packagers can call it without a running
+    // server.
+    if let Some(shell) = cli.completions {
+        use clap::CommandFactory;
+        let mut cmd = args::Cli::command();
+        let name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        return Ok(());
+    }
     // Decide what to do based on args.  Mutually exclusive (clap enforces
     // it via the `conflicts_with` attributes on the Cli struct).
     if let Some(sql) = cli.command.clone() {

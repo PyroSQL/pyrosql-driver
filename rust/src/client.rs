@@ -62,15 +62,21 @@ impl Client {
     /// Returns [`ClientError`] if the TCP connect or PWire runtime spawn fails.
     pub async fn connect(config: ConnectConfig) -> Result<Self, ClientError> {
         let addr = format!("{}:{}", config.host, config.port);
-        let conn = PyroWireConnection::connect(&addr)?;
-
-        // Optionally apply SET syntax_mode on connection — best-effort,
-        // tolerated to fail on servers that don't recognise the pragma.
-        if let Some(mode) = config.syntax_mode {
-            let _ = conn
-                .query_simple(&format!("SET syntax_mode = '{}'", mode.as_set_value()))
-                .await;
-        }
+        // Send MSG_AUTH unconditionally when the caller supplied credentials
+        // or selected a SQL dialect — that way the server locks the session
+        // into PostAuth state and applies the dialect before the first query
+        // runs. If none of those are set we still go through the auth path
+        // with empty credentials so the server consistently transitions to
+        // PostAuth; the cost is one extra roundtrip at connect time, which
+        // is paid once per Client and lets us drop the old `SET syntax_mode`
+        // fallback that had a race between connect and first query.
+        let dialect = config.syntax_mode.map(|m| m.as_set_value().to_owned());
+        let conn = PyroWireConnection::connect_authed(
+            &addr,
+            &config.user,
+            &config.password,
+            dialect.as_deref(),
+        )?;
 
         Ok(Self { conn: Arc::new(conn), config })
     }
@@ -125,6 +131,22 @@ impl Client {
     #[must_use]
     pub fn transport_tier(&self) -> &'static str {
         "PWire"
+    }
+
+    /// Force-close the underlying PWire connection from any thread.
+    ///
+    /// Intended for interactive cancel: an `.await`ing query on this
+    /// client returns a `ClientError::Connection` and the session is
+    /// dropped server-side. Subsequent calls on this `Client` continue
+    /// to fail, so the caller (REPL) must open a fresh `Client` via
+    /// [`Client::connect`] or via [`crate::ConnectConfig`].
+    ///
+    /// This is a TCP-level hammer — PWire still lacks a CancelRequest
+    /// equivalent, so the only thing we can do from the caller side
+    /// without server-side protocol support is drop the socket.
+    /// Idempotent.
+    pub fn abort(&self) {
+        self.conn.abort();
     }
 
     // === Transactions ===
