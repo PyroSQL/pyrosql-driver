@@ -1,6 +1,6 @@
 # pyrosql
 
-Pure-Python driver for [PyroSQL](https://github.com/valkarn/pyrosql) using ctypes FFI.
+Pure-Python driver for [PyroSQL](https://github.com/PyroSQL/pyrosql) using ctypes FFI.
 
 Loads the prebuilt `libpyrosql_ffi_pwire` shared library (built by `ffi-pwire/`) and communicates with the server over the PWire binary protocol. No Rust toolchain or compilation required at install time.
 
