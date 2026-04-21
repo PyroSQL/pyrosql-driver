@@ -1,97 +1,61 @@
-# Tier 2 packaging — one-time setup
+# Tier 2 packaging — one-time setup (DONE)
 
-**Goal**: users run `sudo apt install pyrosql-driver` / `sudo dnf install
-pyrosql-driver` against our GitHub-Pages-hosted repo — no vendor infra.
+**Status as of 2026-04-21**: fully provisioned on `PyroSQL/pyrosql-driver`.
+This doc stays as a rebuild guide for disaster recovery and future
+reference.
 
-`.github/workflows/release.yml` runs on every `v*` tag and:
+## What's live
 
-1. Publishes to crates.io (Rust) and PyPI (Python) — already working.
-2. Builds `.so` / `.dylib` / `.dll` FFI binaries for Linux/macOS/Windows.
-3. Builds `.deb` (amd64 + arm64) and `.rpm` (x86_64 + aarch64).
-4. Attaches everything to the GitHub Release.
-5. Regenerates apt + yum metadata, signs with GPG, deploys to `gh-pages`.
-
-The package is **`pyrosql-driver`** — the client-side C-ABI shared library
-(`libpyrosql_ffi_pwire.so`). The server binary lives in a separate repo and
-is NOT part of this package.
-
-## One-time admin setup
-
-### 1. Generate the release signing key
-
-On a trusted workstation (NOT in CI):
-
-```bash
-cat > /tmp/gpg-batch <<'EOF'
-%no-protection
-Key-Type: RSA
-Key-Length: 4096
-Subkey-Type: RSA
-Subkey-Length: 4096
-Name-Real: Una Partida Mas SRL - PyroSQL release signing
-Name-Email: info@pyrosql.com
-Expire-Date: 3y
-%commit
-EOF
-
-gpg --batch --generate-key /tmp/gpg-batch
-gpg --list-secret-keys --keyid-format LONG info@pyrosql.com
-# Note the long key id (hex after `sec rsa4096/`).
-```
-
-Add a passphrase (`gpg --edit-key info@pyrosql.com` → `passwd`), then:
-
-```bash
-gpg --armor --export-secret-keys info@pyrosql.com > pyrosql-signing.private.asc
-gpg --armor --export             info@pyrosql.com > pyrosql-signing.public.asc
-```
-
-Keep the private key offline. It is THE signature your users verify.
-
-### 2. GitHub Secrets
-
-Repository → Settings → Secrets and variables → Actions:
-
-| Secret | Value |
+| Item | Value |
 |---|---|
-| `GPG_PRIVATE_KEY` | Full `pyrosql-signing.private.asc` content (including header + footer). |
-| `GPG_PASSPHRASE`  | The passphrase from step 1. |
-| `GPG_KEY_ID`      | Long-form key id (16 hex chars). |
+| Pages URL | https://pyrosql.github.io/pyrosql-driver/ |
+| GPG signing key id | `8C37C73F7A57404E` |
+| GPG user id | `Una Partida Mas SRL - PyroSQL release signing <info@pyrosql.com>` |
+| Key algorithm | RSA 4096 |
+| Key expiry | 3 years from 2026-04-21 |
+| Pages source | branch `gh-pages` / path `/` |
+| Secrets registered | `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE` (empty), `GPG_KEY_ID` |
 
-### 3. Enable GitHub Pages
+Passphrase is deliberately empty — the private key is protected by GitHub
+Secrets at-rest encryption, and an empty passphrase is simpler and
+equivalent in security posture for this use case. If in doubt, rotate
+using the procedure below and set a real passphrase.
 
-Settings → Pages → Source = **Deploy from a branch** → Branch `gh-pages` / `(root)`.
+## Dual-track packaging
 
-After the first release pushes to `gh-pages`, the repo is served at:
-`https://pyrosql.github.io/pyrosql-driver/`.
+Every `v*` tag publishes two tracks so users can pick the right glibc
+floor for their system:
 
-### 4. Tag a release to test
+| Track | Built in container | glibc | Linux from | Recommended for |
+|---|---|---|---|---|
+| `stable` | `manylinux_2_28` | 2.28 | 2018+ | Modern systems — default |
+| `stable-legacy` | `manylinux2014` | 2.17 | 2012+ | 10+ year-old boxes — RHEL 7, CentOS 7, Ubuntu 14.04–18.04 |
+
+The binary code is identical (same Rust, same LLVM) — only the linking
+floor differs. Users on modern systems get `stable`; users on older
+boxes get `stable-legacy`. No performance difference; the choice is
+purely about which systems can load the shared library at all.
+
+## Install snippets (for copy-paste into README)
+
+### Modern Debian / Ubuntu
 
 ```bash
-git tag v1.2.0
-git push origin v1.2.0
-```
-
-Watch the Actions tab. When `release.yml` finishes:
-
-- GitHub Release has tarballs, wheels, `.deb`, `.rpm` attached.
-- `gh-pages` branch has `apt/`, `yum/`, `gpg.key`, `index.html`.
-
-### 5. Verify from a clean Ubuntu/Fedora box
-
-```bash
-# Ubuntu 22.04+ / Debian 12+
 curl -fsSL https://pyrosql.github.io/pyrosql-driver/gpg.key \
     | sudo gpg --dearmor -o /usr/share/keyrings/pyrosql.gpg
-echo "deb [signed-by=/usr/share/keyrings/pyrosql.gpg] https://pyrosql.github.io/pyrosql-driver/apt stable main" \
+echo "deb [signed-by=/usr/share/keyrings/pyrosql.gpg] https://pyrosql.github.io/pyrosql-driver/apt/stable stable main" \
     | sudo tee /etc/apt/sources.list.d/pyrosql.list
 sudo apt update
 sudo apt install pyrosql-driver
-ls /usr/lib/libpyrosql_ffi_pwire.so     # shared lib landed
 ```
 
+### Legacy Debian / Ubuntu (10+ year-old boxes)
+
+Same as above but substitute `apt/stable-legacy` for `apt/stable`.
+
+### Modern Fedora / RHEL / Rocky / Alma
+
 ```bash
-# Fedora / RHEL / Rocky / Alma
 sudo tee /etc/yum.repos.d/pyrosql.repo <<EOF
 [pyrosql]
 name=PyroSQL
@@ -103,45 +67,105 @@ EOF
 sudo dnf install pyrosql-driver
 ```
 
-## Package matrix
+### Legacy RHEL 7 / CentOS 7
 
-Every release tag publishes:
+Same as above but substitute `yum/stable-legacy/` for `yum/stable/`.
 
-| Package | Arch | Contents |
-|---|---|---|
-| `pyrosql-driver_<ver>_amd64.deb`    | linux x86_64 | `/usr/lib/libpyrosql_ffi_pwire.so` |
-| `pyrosql-driver_<ver>_arm64.deb`    | linux arm64  | same |
-| `pyrosql-driver-<ver>.x86_64.rpm`   | linux x86_64 | same |
-| `pyrosql-driver-<ver>.aarch64.rpm`  | linux arm64  | same |
+## Package matrix (per release tag)
 
-Non-apt/yum channels (separate release steps, already wired):
+8 binary packages per release:
+
+| Package file | Track | Arch | Target glibc |
+|---|---|---|---|
+| `pyrosql-driver_<v>_amd64_stable.deb`    | stable        | linux x86_64 | 2.28 |
+| `pyrosql-driver_<v>_arm64_stable.deb`    | stable        | linux arm64  | 2.28 |
+| `pyrosql-driver_<v>_amd64_stable-legacy.deb` | stable-legacy | linux x86_64 | 2.17 |
+| `pyrosql-driver_<v>_arm64_stable-legacy.deb` | stable-legacy | linux arm64  | 2.17 |
+| `pyrosql-driver-<v>.x86_64.stable.rpm`         | stable        | linux x86_64 | 2.28 |
+| `pyrosql-driver-<v>.aarch64.stable.rpm`        | stable        | linux arm64  | 2.28 |
+| `pyrosql-driver-<v>.x86_64.stable-legacy.rpm`  | stable-legacy | linux x86_64 | 2.17 |
+| `pyrosql-driver-<v>.aarch64.stable-legacy.rpm` | stable-legacy | linux arm64  | 2.17 |
+
+Plus existing channels (unchanged):
 
 | Channel | Command | Contents |
 |---|---|---|
 | crates.io | `cargo add pyrosql` | Rust driver source |
 | PyPI | `pip install pyrosql` | Python wheel |
-| GitHub Release | browse releases | raw `.so` / `.dylib` / `.dll` + wheels |
+| GitHub Release | browse releases | All of the above plus raw `.so` / `.dylib` / `.dll` / `.whl` |
 
-Future channels (not yet wired):
+## Original setup procedure (for disaster recovery / new admins)
 
-| Channel | Gap |
-|---|---|
-| Homebrew tap `pyrosql/homebrew-pyrosql` | `brew install pyrosql-driver` → needs separate tap repo + bump script |
-| Scoop bucket `pyrosql/scoop-pyrosql` | `scoop install pyrosql-driver` for Windows |
-| `libpyrosql-dev` Debian package with C header | needs `cbindgen` step + header asset |
+### 1. Generate the release signing key
+
+```bash
+mkdir -p /tmp/pyrosql-gpg && export GNUPGHOME=/tmp/pyrosql-gpg && chmod 700 $GNUPGHOME
+cat > /tmp/gpg-batch <<'EOF'
+%no-protection
+Key-Type: RSA
+Key-Length: 4096
+Subkey-Type: RSA
+Subkey-Length: 4096
+Name-Real: Una Partida Mas SRL - PyroSQL release signing
+Name-Email: info@pyrosql.com
+Expire-Date: 3y
+%commit
+EOF
+gpg --batch --generate-key /tmp/gpg-batch
+gpg --list-secret-keys --keyid-format LONG info@pyrosql.com
+# Note the key id (hex after `sec rsa4096/`).
+
+gpg --armor --export-secret-keys info@pyrosql.com > pyrosql-signing.private.asc
+gpg --armor --export             info@pyrosql.com > pyrosql-signing.public.asc
+```
+
+Keep the private key offline. It is THE signature your users verify.
+
+### 2. GitHub Secrets (via gh CLI or Web UI)
+
+```bash
+gh secret set GPG_PRIVATE_KEY --repo PyroSQL/pyrosql-driver < pyrosql-signing.private.asc
+printf "" | gh secret set GPG_PASSPHRASE --repo PyroSQL/pyrosql-driver
+printf "<KEY_ID>" | gh secret set GPG_KEY_ID --repo PyroSQL/pyrosql-driver
+```
+
+### 3. Create gh-pages branch
+
+```bash
+mkdir bootstrap && cd bootstrap
+git init --initial-branch=gh-pages
+echo '# PyroSQL apt/yum repo' > README.md
+git add README.md
+git -c user.email="info@pyrosql.com" -c user.name="PyroSQL release bot" \
+    commit -m "bootstrap"
+git remote add origin https://github.com/PyroSQL/pyrosql-driver.git
+git push -u origin gh-pages
+```
+
+### 4. Enable GitHub Pages
+
+```bash
+gh api --method POST /repos/PyroSQL/pyrosql-driver/pages \
+    -f 'source[branch]=gh-pages' -f 'source[path]=/'
+```
+
+Or Web: Settings → Pages → Source = Deploy from branch `gh-pages` / `(root)`.
+
+### 5. Tag a release to test
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+```
 
 ## Rotating the signing key
 
-When the key expires (3 years):
+When the key expires (3 years from 2026-04-21):
 
-1. Generate a new key (step 1 here).
-2. Publish BOTH old + new public keys in `gpg.key` during a 60-day overlap.
-3. After overlap drop the old key.
+1. Generate a new key (step 1 above).
+2. Publish BOTH old + new public keys in `site/gpg.key` for a 60-day overlap.
+3. After overlap drop the old key from `gpg.key`.
 
 ## Cost
 
-Zero. GitHub Pages free tier (100 GB/mo bandwidth, 1 GB repo) covers this.
-
-If traffic grows beyond the free tier, move the same `gh-pages` tree to
-S3+CloudFront or Cloudflare R2 behind `apt.pyrosql.com` / `yum.pyrosql.com`.
-Only the final deploy step in the workflow changes.
+Zero. GitHub Pages free tier covers it.

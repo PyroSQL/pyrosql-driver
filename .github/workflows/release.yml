@@ -103,95 +103,107 @@ jobs:
   # .deb for Debian / Ubuntu — amd64 + arm64. Payload = libpyrosql_ffi_pwire.so
   # from the ffi-pwire crate. Package name = `pyrosql-driver`.
   # ─────────────────────────────────────────────────────────────────────────
+  # .deb for Debian / Ubuntu — DUAL TRACK:
+  #   stable         : built in manylinux_2_28 (glibc 2.28, Linux 2018+).
+  #                    Default. Modern kernels + glibc, best perf on
+  #                    current systems.
+  #   stable-legacy  : built in manylinux2014 (glibc 2.17, Linux 2012+).
+  #                    Covers RHEL/CentOS 7, Ubuntu 14.04+, any 10-year-old
+  #                    box. Same code, same perf — different linking floor.
   build-deb:
-    name: Build .deb (${{ matrix.arch }})
+    name: Build .deb (${{ matrix.track }}/${{ matrix.arch }})
     runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            target: x86_64-unknown-linux-gnu
-            use_cross: false
-          - arch: arm64
-            target: aarch64-unknown-linux-gnu
-            use_cross: true
+          - { track: stable,        arch: amd64, target: x86_64-unknown-linux-gnu,  container: "quay.io/pypa/manylinux_2_28_x86_64" }
+          - { track: stable,        arch: arm64, target: aarch64-unknown-linux-gnu, container: "quay.io/pypa/manylinux_2_28_aarch64" }
+          - { track: stable-legacy, arch: amd64, target: x86_64-unknown-linux-gnu,  container: "quay.io/pypa/manylinux2014_x86_64" }
+          - { track: stable-legacy, arch: arm64, target: aarch64-unknown-linux-gnu, container: "quay.io/pypa/manylinux2014_aarch64" }
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: deb-${{ matrix.target }}
-      - name: Install cross
-        if: matrix.use_cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-      - name: Install cargo-deb
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb
-      - name: Build cdylib
+
+      # manylinux images are CentOS-based → yum/dnf, not apt. They also
+      # lack Rust + cargo-deb out of the box; install both inside.
+      - name: Install Rust toolchain in container
+        shell: bash
         run: |
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
-          else
-            cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
-          fi
-      - name: Package .deb
-        run: cargo deb --manifest-path ffi-pwire/Cargo.toml --target ${{ matrix.target }} --no-build
-      - run: ls -la ffi-pwire/target/${{ matrix.target }}/debian/
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.94.1 --profile minimal --target ${{ matrix.target }}
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install dpkg-dev + cargo-deb
+        shell: bash
+        run: |
+          # cargo-deb is a Rust binary; install via cargo. dpkg-dev is
+          # needed by cargo-deb internally for Packages index diffs, etc.
+          yum install -y dpkg dpkg-dev 2>/dev/null || true
+          $HOME/.cargo/bin/cargo install cargo-deb --locked
+
+      - name: Build cdylib
+        shell: bash
+        run: cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
+
+      - name: Package .deb (retag with track suffix)
+        shell: bash
+        run: |
+          cargo deb --manifest-path ffi-pwire/Cargo.toml --target ${{ matrix.target }} --no-build
+          # cargo-deb names the file pyrosql-driver_<ver>_<arch>.deb — rename to
+          # include the track so the publish job routes it correctly.
+          cd ffi-pwire/target/${{ matrix.target }}/debian
+          for f in *.deb; do
+            mv "$f" "${f%.deb}_${{ matrix.track }}.deb"
+          done
+          ls -la
+
       - uses: actions/upload-artifact@v4
         with:
-          name: debs-${{ matrix.arch }}
+          name: debs-${{ matrix.track }}-${{ matrix.arch }}
           path: ffi-pwire/target/${{ matrix.target }}/debian/*.deb
           if-no-files-found: error
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # .rpm for Fedora / RHEL / Rocky / Alma — x86_64 + aarch64.
-  # ─────────────────────────────────────────────────────────────────────────
+  # .rpm for Fedora / RHEL / Rocky / Alma — same dual-track strategy.
   build-rpm:
-    name: Build .rpm (${{ matrix.arch }})
+    name: Build .rpm (${{ matrix.track }}/${{ matrix.arch }})
     runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
-            target: x86_64-unknown-linux-gnu
-            use_cross: false
-          - arch: aarch64
-            target: aarch64-unknown-linux-gnu
-            use_cross: true
+          - { track: stable,        arch: x86_64,  target: x86_64-unknown-linux-gnu,  container: "quay.io/pypa/manylinux_2_28_x86_64" }
+          - { track: stable,        arch: aarch64, target: aarch64-unknown-linux-gnu, container: "quay.io/pypa/manylinux_2_28_aarch64" }
+          - { track: stable-legacy, arch: x86_64,  target: x86_64-unknown-linux-gnu,  container: "quay.io/pypa/manylinux2014_x86_64" }
+          - { track: stable-legacy, arch: aarch64, target: aarch64-unknown-linux-gnu, container: "quay.io/pypa/manylinux2014_aarch64" }
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: rpm-${{ matrix.target }}
-      - name: Install cross
-        if: matrix.use_cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-      - name: Install cargo-generate-rpm
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-generate-rpm
-      - name: Build cdylib
+
+      - name: Install Rust toolchain in container
+        shell: bash
         run: |
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
-          else
-            cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
-          fi
-      - name: Package .rpm
-        run: cargo generate-rpm -p ffi-pwire --target ${{ matrix.target }} --payload-compress zstd
-      - run: find ffi-pwire/target -name '*.rpm' -type f
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.94.1 --profile minimal --target ${{ matrix.target }}
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install cargo-generate-rpm
+        shell: bash
+        run: $HOME/.cargo/bin/cargo install cargo-generate-rpm --locked
+
+      - name: Build cdylib
+        shell: bash
+        run: cargo build --manifest-path ffi-pwire/Cargo.toml --release --target ${{ matrix.target }}
+
+      - name: Package .rpm (retag with track suffix)
+        shell: bash
+        run: |
+          cargo generate-rpm -p ffi-pwire --target ${{ matrix.target }} --payload-compress zstd
+          cd ffi-pwire/target/${{ matrix.target }}/generate-rpm
+          for f in *.rpm; do
+            mv "$f" "${f%.rpm}.${{ matrix.track }}.rpm"
+          done
+          ls -la
       - uses: actions/upload-artifact@v4
         with:
           name: rpms-${{ matrix.arch }}
@@ -274,11 +286,14 @@ jobs:
 
       - name: Ensure gh-pages tree exists
         run: |
-          mkdir -p site/apt/pool/main
-          mkdir -p site/apt/dists/stable/main/binary-amd64
-          mkdir -p site/apt/dists/stable/main/binary-arm64
-          mkdir -p site/yum/stable/x86_64
-          mkdir -p site/yum/stable/aarch64
+          # Dual-track: `stable` (glibc 2.28) and `stable-legacy` (glibc 2.17).
+          for track in stable stable-legacy; do
+            mkdir -p site/apt/$track/pool/main
+            mkdir -p site/apt/$track/dists/stable/main/binary-amd64
+            mkdir -p site/apt/$track/dists/stable/main/binary-arm64
+            mkdir -p site/yum/$track/x86_64
+            mkdir -p site/yum/$track/aarch64
+          done
           [ -d site/.git ] || git -C site init -q --initial-branch=gh-pages
 
       - name: Install apt + yum tooling
@@ -310,55 +325,74 @@ jobs:
           path: rpms
           merge-multiple: true
 
-      - name: Copy .deb into pool
-        run: cp debs/*.deb site/apt/pool/main/
-
-      - name: Copy .rpm into per-arch pool
+      - name: Route .deb into per-track pool
         run: |
-          for f in rpms/*.rpm; do
+          # Files are named *_stable.deb or *_stable-legacy.deb (from the
+          # rename step in build-deb). Route by suffix before the .deb.
+          for f in debs/*.deb; do
             case "$f" in
-              *x86_64.rpm)  cp "$f" site/yum/stable/x86_64/ ;;
-              *aarch64.rpm) cp "$f" site/yum/stable/aarch64/ ;;
-              *) echo "::warning::unknown rpm arch for $f" ;;
+              *_stable-legacy.deb) cp "$f" site/apt/stable-legacy/pool/main/ ;;
+              *_stable.deb)        cp "$f" site/apt/stable/pool/main/ ;;
+              *) echo "::warning::unknown track suffix for $f" ;;
             esac
           done
 
-      - name: Regenerate apt metadata
-        env:
-          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      - name: Route .rpm into per-track/per-arch pool
         run: |
-          cd site/apt
-          for arch in amd64 arm64; do
-            dpkg-scanpackages --arch $arch pool/ > dists/stable/main/binary-$arch/Packages
-            gzip -kf dists/stable/main/binary-$arch/Packages
+          # Files end .stable.rpm or .stable-legacy.rpm (rename in build-rpm).
+          for f in rpms/*.rpm; do
+            arch=x86_64
+            case "$f" in
+              *aarch64*) arch=aarch64 ;;
+            esac
+            case "$f" in
+              *.stable-legacy.rpm) cp "$f" site/yum/stable-legacy/$arch/ ;;
+              *.stable.rpm)        cp "$f" site/yum/stable/$arch/ ;;
+              *) echo "::warning::unknown track suffix for $f" ;;
+            esac
           done
-          cat > apt-release.conf <<EOF
-          APT::FTPArchive::Release::Origin "PyroSQL";
-          APT::FTPArchive::Release::Label "PyroSQL";
-          APT::FTPArchive::Release::Suite "stable";
-          APT::FTPArchive::Release::Codename "stable";
-          APT::FTPArchive::Release::Architectures "amd64 arm64";
-          APT::FTPArchive::Release::Components "main";
-          APT::FTPArchive::Release::Description "PyroSQL apt repository";
-          EOF
-          apt-ftparchive -c apt-release.conf release dists/stable > dists/stable/Release
-          echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
-            --default-key "$GPG_KEY_ID" -abs -o dists/stable/Release.gpg dists/stable/Release
-          echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
-            --default-key "$GPG_KEY_ID" --clearsign -o dists/stable/InRelease dists/stable/Release
 
-      - name: Regenerate yum repodata
+      - name: Regenerate apt metadata (per track)
         env:
           GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          for arch in x86_64 aarch64; do
-            dir=site/yum/stable/$arch
-            createrepo_c $dir
+          for track in stable stable-legacy; do
+            cd site/apt/$track
+            for arch in amd64 arm64; do
+              dpkg-scanpackages --arch $arch pool/ > dists/stable/main/binary-$arch/Packages
+              gzip -kf dists/stable/main/binary-$arch/Packages
+            done
+            cat > apt-release.conf <<EOF
+            APT::FTPArchive::Release::Origin "PyroSQL";
+            APT::FTPArchive::Release::Label "PyroSQL-${track}";
+            APT::FTPArchive::Release::Suite "stable";
+            APT::FTPArchive::Release::Codename "stable";
+            APT::FTPArchive::Release::Architectures "amd64 arm64";
+            APT::FTPArchive::Release::Components "main";
+            APT::FTPArchive::Release::Description "PyroSQL apt repository (${track})";
+            EOF
+            apt-ftparchive -c apt-release.conf release dists/stable > dists/stable/Release
             echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
-              --default-key "$GPG_KEY_ID" --detach-sign --armor \
-              --output $dir/repodata/repomd.xml.asc $dir/repodata/repomd.xml
+              --default-key "$GPG_KEY_ID" -abs -o dists/stable/Release.gpg dists/stable/Release
+            echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --default-key "$GPG_KEY_ID" --clearsign -o dists/stable/InRelease dists/stable/Release
+            cd -
+          done
+
+      - name: Regenerate yum repodata (per track)
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          for track in stable stable-legacy; do
+            for arch in x86_64 aarch64; do
+              dir=site/yum/$track/$arch
+              createrepo_c $dir
+              echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+                --default-key "$GPG_KEY_ID" --detach-sign --armor \
+                --output $dir/repodata/repomd.xml.asc $dir/repodata/repomd.xml
+            done
           done
 
       - name: Export public key
@@ -373,16 +407,34 @@ jobs:
           <h1>PyroSQL driver — Linux package repository</h1>
           <p>Client-side driver only. For the server binary see the
              <code>pyrosql-server</code> package distributed separately.</p>
-          <h2>Debian / Ubuntu</h2>
+          <h2>Pick a track</h2>
+          <p><strong>stable</strong> — built on glibc 2.28 (CentOS 8 / Ubuntu 20.04 / Debian 11+). Use this unless you know you need legacy.<br>
+          <strong>stable-legacy</strong> — built on glibc 2.17 (CentOS 7 / Ubuntu 14.04+). Use this on &gt;5-year-old systems (RHEL 7, CentOS 7, old Ubuntu). Identical code, different glibc floor.</p>
+          <h2>Debian / Ubuntu — modern (stable)</h2>
           <pre>curl -fsSL https://${PAGES_URL}/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/pyrosql.gpg
-          echo "deb [signed-by=/usr/share/keyrings/pyrosql.gpg] https://${PAGES_URL}/apt stable main" | sudo tee /etc/apt/sources.list.d/pyrosql.list
+          echo "deb [signed-by=/usr/share/keyrings/pyrosql.gpg] https://${PAGES_URL}/apt/stable stable main" | sudo tee /etc/apt/sources.list.d/pyrosql.list
           sudo apt update
           sudo apt install pyrosql-driver</pre>
-          <h2>Fedora / RHEL / Rocky / Alma</h2>
+          <h2>Debian / Ubuntu — legacy (stable-legacy)</h2>
+          <pre>curl -fsSL https://${PAGES_URL}/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/pyrosql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pyrosql.gpg] https://${PAGES_URL}/apt/stable-legacy stable main" | sudo tee /etc/apt/sources.list.d/pyrosql.list
+          sudo apt update
+          sudo apt install pyrosql-driver</pre>
+          <h2>Fedora / RHEL / Rocky / Alma — modern (stable)</h2>
           <pre>sudo tee /etc/yum.repos.d/pyrosql.repo <<EOF
           [pyrosql]
           name=PyroSQL
           baseurl=https://${PAGES_URL}/yum/stable/\\\$basearch/
+          enabled=1
+          gpgcheck=1
+          gpgkey=https://${PAGES_URL}/gpg.key
+          EOF
+          sudo dnf install pyrosql-driver</pre>
+          <h2>Fedora / RHEL / Rocky / Alma — legacy (stable-legacy)</h2>
+          <pre>sudo tee /etc/yum.repos.d/pyrosql.repo <<EOF
+          [pyrosql]
+          name=PyroSQL
+          baseurl=https://${PAGES_URL}/yum/stable-legacy/\\\$basearch/
           enabled=1
           gpgcheck=1
           gpgkey=https://${PAGES_URL}/gpg.key
