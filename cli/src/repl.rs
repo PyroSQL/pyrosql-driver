@@ -39,45 +39,10 @@ fn prompt(session: &Session, in_multiline: bool) -> &'static str {
     }
 }
 
-/// Is this buffer a complete SQL statement?  True when the last non-
-/// whitespace, non-comment character is a `;`, ignoring semicolons
-/// inside single-quoted strings.  Cheap pass — good enough for
-/// interactive use.
-fn is_complete(buffer: &str) -> bool {
-    let mut last_meaningful: Option<char> = None;
-    let mut in_str = false;
-    let mut in_line_comment = false;
-    for ch in buffer.chars() {
-        if in_line_comment {
-            if ch == '\n' {
-                in_line_comment = false;
-            }
-            continue;
-        }
-        if in_str {
-            if ch == '\'' {
-                in_str = false;
-            }
-            last_meaningful = Some(ch);
-            continue;
-        }
-        match ch {
-            '\'' => {
-                in_str = true;
-                last_meaningful = Some(ch);
-            }
-            '-' if last_meaningful == Some('-') => {
-                // second dash — we retroactively mark the previous char
-                // as a comment opener by entering line-comment mode.
-                in_line_comment = true;
-            }
-            ';' => last_meaningful = Some(';'),
-            c if c.is_whitespace() => {}
-            c => last_meaningful = Some(c),
-        }
-    }
-    last_meaningful == Some(';')
-}
+// REPL statement-completion check delegates to the crate-wide tokenizer
+// so single-quotes, double-quotes, dollar-quoted blocks, line comments,
+// and block comments are all handled identically to the script splitter.
+use crate::sqltok::is_complete;
 
 pub fn run_repl(cli: &Cli) -> Result<()> {
     let mut session = open_session(cli)?;
@@ -162,32 +127,4 @@ pub fn run_repl(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_complete;
-
-    #[test]
-    fn incomplete_without_semicolon() {
-        assert!(!is_complete("SELECT 1"));
-        assert!(!is_complete("SELECT 1\nFROM t"));
-    }
-
-    #[test]
-    fn complete_with_semicolon() {
-        assert!(is_complete("SELECT 1;"));
-        assert!(is_complete("SELECT 1;\n"));
-        assert!(is_complete("SELECT 1;   "));
-    }
-
-    #[test]
-    fn semicolon_inside_string_not_terminator() {
-        assert!(!is_complete("INSERT INTO t VALUES ('hi;')"));
-        assert!(is_complete("INSERT INTO t VALUES ('hi;');"));
-    }
-
-    #[test]
-    fn line_comment_ignored() {
-        assert!(!is_complete("SELECT 1 -- trailing comment"));
-        assert!(is_complete("SELECT 1; -- trailing comment\n"));
-    }
-}
+// Tests for statement completion live in `sqltok.rs`.

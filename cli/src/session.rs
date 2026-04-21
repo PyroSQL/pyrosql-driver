@@ -223,98 +223,10 @@ pub fn run_file(cli: &Cli, path: &str) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    for stmt in split_statements(&content) {
-        let trimmed = stmt.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        session.execute_and_print(trimmed, &mut out)?;
+    for stmt in crate::sqltok::split_statements(&content) {
+        session.execute_and_print(&stmt, &mut out)?;
     }
     Ok(())
 }
 
-/// Split a SQL script on `;` boundaries, ignoring semicolons inside
-/// single-quoted strings and `--` line comments.  Good enough for psql-
-/// style scripts; does NOT handle dollar-quoted blocks yet.
-pub fn split_statements(src: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_str = false;
-    let mut in_line_comment = false;
-    for ch in src.chars() {
-        if in_line_comment {
-            cur.push(ch);
-            if ch == '\n' {
-                in_line_comment = false;
-            }
-            continue;
-        }
-        if in_str {
-            cur.push(ch);
-            if ch == '\'' {
-                in_str = false;
-            }
-            continue;
-        }
-        match ch {
-            '\'' => {
-                in_str = true;
-                cur.push(ch);
-            }
-            '-' if cur.ends_with('-') => {
-                in_line_comment = true;
-                cur.push(ch);
-            }
-            ';' => {
-                if !cur.trim().is_empty() {
-                    out.push(cur.clone());
-                }
-                cur.clear();
-            }
-            _ => cur.push(ch),
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::split_statements;
-
-    #[test]
-    fn split_empty() {
-        assert!(split_statements("").is_empty());
-        assert!(split_statements("   \n\n  ").is_empty());
-    }
-
-    #[test]
-    fn split_simple() {
-        let v = split_statements("SELECT 1; SELECT 2;");
-        assert_eq!(v.len(), 2);
-        assert!(v[0].contains("SELECT 1"));
-        assert!(v[1].contains("SELECT 2"));
-    }
-
-    #[test]
-    fn split_no_trailing_semicolon() {
-        let v = split_statements("SELECT 1");
-        assert_eq!(v.len(), 1);
-    }
-
-    #[test]
-    fn split_string_contains_semicolon() {
-        let v = split_statements("INSERT INTO t VALUES ('a;b'); SELECT 1;");
-        assert_eq!(v.len(), 2);
-        assert!(v[0].contains("'a;b'"));
-    }
-
-    #[test]
-    fn split_line_comment() {
-        let v = split_statements("-- first; stmt\nSELECT 1;");
-        assert_eq!(v.len(), 1);
-        assert!(v[0].contains("SELECT 1"));
-    }
-}
+// Tests for statement splitting live next to the tokenizer in `sqltok.rs`.

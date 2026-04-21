@@ -20,10 +20,20 @@ thiserror = "2"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
-# ── Local development override ──
-# When a sibling checkout of the main PyroSQL repository is available at
-# ../pyrosql, prefer it over the git dep so edits to pyro-runtime are
-# picked up without a commit+push cycle.  CI runners (without the sibling
-# checkout) fall back to the git dep declared in `rust/Cargo.toml`.
-[patch."https://github.com/PyroSQL/pyrosql.git"]
-pyro-runtime = { path = "../pyrosql/crates/pyro-runtime" }
+# ── Local development override (opt-in) ──
+# Originally this section patched `pyro-runtime` to a sibling checkout at
+# `../pyrosql/crates/pyro-runtime` so driver developers could iterate on
+# both repos without commit+push cycles.  Cargo evaluates `[patch]`
+# unconditionally, though, so the patch broke every CI run that didn't
+# have that sibling tree (the v1.3.3 build-deb-cli jobs caught this).
+#
+# If you want the patch back as a developer, add it to your personal
+# `.cargo/config.toml` (which cargo merges into the workspace spec)
+# rather than committing it:
+#
+#     # ~/.cargo/config.toml or <repo>/.cargo/config.toml (gitignored)
+#     [patch."https://github.com/PyroSQL/pyrosql.git"]
+#     pyro-runtime = { path = "../pyrosql/crates/pyro-runtime" }
+#
+# CI uses the git dep declared in `rust/Cargo.toml`, resolved through the
+# `PYROSQL_REPO_TOKEN` secret configured in the release workflow.

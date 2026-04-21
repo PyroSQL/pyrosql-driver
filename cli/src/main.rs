@@ -17,6 +17,7 @@ mod format;
 mod meta;
 mod repl;
 mod session;
+mod sqltok;
 
 use std::process::ExitCode;
 
