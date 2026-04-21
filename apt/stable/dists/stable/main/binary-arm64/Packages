@@ -1,0 +1,19 @@
+Package: pyrosql-driver
+Version: 1.1.0-1
+Architecture: arm64
+Maintainer: Una Partida Mas SRL <info@pyrosql.com>
+Installed-Size: 457
+Filename: pool/main/pyrosql-driver_1.1.0-1_arm64.deb
+Size: 146388
+MD5sum: 4884cbca00168b862e508304e75b37f1
+SHA1: b666f4adbea87dd4ad0e41f61a836c4d59094e56
+SHA256: 12662e34921a4dc5a0d2722b73133546857e80da57b662152a6f6d864b390c86
+Section: libs
+Priority: optional
+Homepage: https://pyrosql.com
+Description: C-ABI shared library for PWire (raw TCP SQL client)
+ PyroSQL client driver — C-ABI shared library (libpyrosql_ffi_pwire.so)
+ that implements the PWire binary protocol. Link your application against
+ this library to connect to a PyroSQL server. Does NOT include the server
+ (install pyrosql-server for that, from a separate package).
+
