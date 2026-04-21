@@ -148,6 +148,14 @@ impl ConnectConfig {
         self
     }
 
+    /// Short alias for [`syntax_mode`](Self::syntax_mode). Added so driver
+    /// users can write `.dialect(SyntaxMode::PostgreSQL)` in parity with
+    /// the CLI's `-D pg` flag and the URL `?dialect=pg` query param.
+    #[must_use]
+    pub fn dialect(self, mode: SyntaxMode) -> Self {
+        self.syntax_mode(mode)
+    }
+
     /// Set the connection scheme.
     #[must_use]
     pub fn scheme(mut self, scheme: Scheme) -> Self {
@@ -207,7 +215,9 @@ impl ConnectConfig {
                         "database" | "db" => cfg.database = value.to_owned(),
                         "user" => cfg.user = value.to_owned(),
                         "password" => cfg.password = value.to_owned(),
-                        "syntax_mode" => cfg.syntax_mode = parse_syntax_mode(value),
+                        "syntax_mode" | "dialect" => {
+                            cfg.syntax_mode = parse_syntax_mode(value)
+                        }
                         _ => {} // ignore unknown params
                     }
                 }
@@ -284,13 +294,16 @@ impl ConnectConfig {
             return Err(ClientError::InvalidUrl("host is required".into()));
         }
 
-        // Parse query parameters
+        // Parse query parameters. `dialect=` is the short alias the CLI
+        // exposes; it is a synonym of the original `syntax_mode=` name
+        // and either spelling sets the same field.
         let mut syntax_mode = None;
         for param in query.split('&') {
             if param.is_empty() { continue; }
             if let Some((key, value)) = param.split_once('=') {
-                if key == "syntax_mode" {
-                    syntax_mode = parse_syntax_mode(value);
+                match key {
+                    "syntax_mode" | "dialect" => syntax_mode = parse_syntax_mode(value),
+                    _ => {}
                 }
             }
         }
@@ -416,6 +429,28 @@ mod tests {
     fn parse_syntax_mode_pg_alias() {
         let cfg = ConnectConfig::from_url("postgres://localhost/mydb?syntax_mode=vsql").unwrap();
         assert_eq!(cfg.syntax_mode, Some(SyntaxMode::PyroSQL));
+    }
+
+    #[test]
+    fn dialect_query_param_is_alias_for_syntax_mode() {
+        // `?dialect=…` mirrors `?syntax_mode=…` verbatim so the CLI's
+        // short alias works through the URL parser too.
+        let cfg = ConnectConfig::from_url("vsql://localhost/mydb?dialect=pg").unwrap();
+        assert_eq!(cfg.syntax_mode, Some(SyntaxMode::PostgreSQL));
+        let cfg = ConnectConfig::from_url("vsql://localhost/mydb?dialect=mysql").unwrap();
+        assert_eq!(cfg.syntax_mode, Some(SyntaxMode::MySQL));
+    }
+
+    #[test]
+    fn dialect_builder_is_alias_for_syntax_mode() {
+        let cfg = ConnectConfig::new("localhost", 12520).dialect(SyntaxMode::MySQL);
+        assert_eq!(cfg.syntax_mode, Some(SyntaxMode::MySQL));
+    }
+
+    #[test]
+    fn unix_url_accepts_dialect_alias() {
+        let cfg = ConnectConfig::from_url("unix:///tmp/x.sock?dialect=mysql").unwrap();
+        assert_eq!(cfg.syntax_mode, Some(SyntaxMode::MySQL));
     }
 
     #[test]

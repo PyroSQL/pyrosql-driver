@@ -60,9 +60,56 @@ use crate::row::{ColumnMeta, QueryResult, Row, Value};
 pub(crate) const VW_REQ_QUERY:       u8 = 0x01;
 pub(crate) const VW_REQ_PREPARE:     u8 = 0x02;
 pub(crate) const VW_REQ_EXECUTE:     u8 = 0x03;
+pub(crate) const VW_REQ_AUTH:        u8 = 0x06;
 pub(crate) const VW_RESP_RESULT_SET: u8 = 0x01;
 pub(crate) const VW_RESP_OK:         u8 = 0x02;
 pub(crate) const VW_RESP_ERROR:      u8 = 0x03;
+
+/// Build an AUTH frame payload mirroring the server's
+/// `codec::decode_auth_payload` layout:
+/// `[user_len:u8][user][pass_len:u8][pass]` plus, when `dialect` is
+/// `Some`, `[dialect_len:u8][dialect]`. `None` omits the trailing
+/// bytes entirely so old servers (and servers that don't yet parse the
+/// dialect field) still handle the frame correctly.
+///
+/// Strings longer than 255 bytes are truncated at the length-byte
+/// boundary — the caller validates credentials upstream.
+fn encode_auth_payload(user: &str, password: &str, dialect: Option<&str>) -> Vec<u8> {
+    let user_b = user.as_bytes();
+    let pass_b = password.as_bytes();
+    let user_len = user_b.len().min(255) as u8;
+    let pass_len = pass_b.len().min(255) as u8;
+    let dialect_b = dialect.map(str::as_bytes);
+    let dialect_len = dialect_b.map(|b| b.len().min(255) as u8).unwrap_or(0);
+    let cap = 2
+        + user_len as usize
+        + pass_len as usize
+        + dialect.map_or(0, |_| 1 + dialect_len as usize);
+    let mut payload = Vec::with_capacity(cap);
+    payload.push(user_len);
+    payload.extend_from_slice(&user_b[..user_len as usize]);
+    payload.push(pass_len);
+    payload.extend_from_slice(&pass_b[..pass_len as usize]);
+    if let Some(b) = dialect_b {
+        payload.push(dialect_len);
+        payload.extend_from_slice(&b[..dialect_len as usize]);
+    }
+    payload
+}
+
+/// Credentials + dialect carried through to the worker thread, used only
+/// when `PyroWireConnection::connect_authed` is the entry point. `None`
+/// at construction time in `connect()` means the worker skips AUTH
+/// entirely (old no-auth behaviour preserved for existing callers).
+#[derive(Debug, Clone)]
+pub(crate) struct AuthParams {
+    pub user: String,
+    pub password: String,
+    /// Server-side dialect name (`"pyro"` / `"pg"` / `"mysql"` or any
+    /// future alias the server advertises). `None` leaves the dialect
+    /// selector out of the frame → server picks its default.
+    pub dialect: Option<String>,
+}
 
 const PBUF_SIZE:  usize = 64 * 1024;
 const PBUF_COUNT: u16   = 16;
@@ -126,6 +173,13 @@ pub struct PyroWireConnection {
     /// `dead_code` allow is deliberate.
     #[allow(dead_code)]
     prepared: Mutex<HashMap<String, u32>>,
+    /// `try_clone()`d handle to the connected TcpStream — used by
+    /// [`abort`](Self::abort) to shut down the socket from any thread.
+    /// The original half was handed to the runtime worker via
+    /// `into_raw_fd`, so this clone is the only handle the caller-
+    /// facing side can touch. `Mutex<Option<_>>` so `abort` can take it
+    /// once (subsequent calls are no-ops) without needing `&mut self`.
+    aborter: Mutex<Option<StdTcpStream>>,
     /// Join handle for the runtime thread — cleaned up on drop.
     worker: Option<JoinHandle<()>>,
 }
@@ -133,7 +187,42 @@ pub struct PyroWireConnection {
 impl PyroWireConnection {
     /// Open a plain-TCP PWire connection to `addr`.  Spawns one dedicated
     /// OS thread that owns the pyro-runtime for this connection.
+    ///
+    /// No AUTH frame is sent — the connection starts straight in anonymous
+    /// mode, matching the pre-dialect behaviour of benches and examples.
+    /// Callers that need to select a SQL dialect at handshake time should
+    /// use [`connect_authed`](Self::connect_authed) instead.
     pub fn connect(addr: &str) -> Result<Self, ClientError> {
+        Self::connect_inner(addr, None)
+    }
+
+    /// Open a PWire connection and send a MSG_AUTH frame carrying the
+    /// supplied credentials and optional dialect selector before handing
+    /// the connection back to the caller.
+    ///
+    /// `dialect` is the server-side name of the parser mode — `"pyro"` /
+    /// `"pg"` / `"mysql"` are the values the server currently recognises.
+    /// Unknown values are silently ignored by the server (it falls back
+    /// to its default), so a newer client sending a future dialect name
+    /// against an older server is a safe no-op instead of a handshake
+    /// failure.
+    pub fn connect_authed(
+        addr: &str,
+        user: &str,
+        password: &str,
+        dialect: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        Self::connect_inner(
+            addr,
+            Some(AuthParams {
+                user: user.to_owned(),
+                password: password.to_owned(),
+                dialect: dialect.map(str::to_owned),
+            }),
+        )
+    }
+
+    fn connect_inner(addr: &str, auth: Option<AuthParams>) -> Result<Self, ClientError> {
         let sock_addr: SocketAddr = addr.parse().or_else(|_| {
             use std::net::ToSocketAddrs;
             addr.to_socket_addrs()
@@ -146,16 +235,25 @@ impl PyroWireConnection {
         std_tcp.set_nodelay(true)
             .map_err(|e| ClientError::Connection(format!("set_nodelay: {e}")))?;
 
+        // Duplicate the fd so the caller side can call `shutdown` from
+        // any thread even after the worker takes ownership of the
+        // original via `into_raw_fd`. `try_clone` on std's TcpStream
+        // is a dup(2) on Unix / WSADuplicateSocket on Windows — both
+        // produce an independent handle onto the same kernel socket.
+        let aborter = std_tcp
+            .try_clone()
+            .map_err(|e| ClientError::Connection(format!("try_clone: {e}")))?;
+
         // Use a one-shot startup channel to confirm the runtime thread
-        // successfully registered the pbuf ring before we declare the
-        // connection ready.
+        // successfully registered the pbuf ring (and completed AUTH when
+        // requested) before we declare the connection ready.
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), ClientError>>();
         let (cmd_tx, cmd_rx) = futures_unbounded::<Cmd>();
 
         let worker = std::thread::Builder::new()
             .name("pyro-wire-rt".into())
             .spawn(move || {
-                runtime_worker(std_tcp, cmd_rx, ready_tx);
+                runtime_worker(std_tcp, cmd_rx, ready_tx, auth);
             })
             .map_err(|e| ClientError::Connection(format!("spawn pyro-wire-rt thread: {e}")))?;
 
@@ -170,8 +268,35 @@ impl PyroWireConnection {
         Ok(Self {
             cmd_tx,
             prepared: Mutex::new(HashMap::new()),
+            aborter: Mutex::new(Some(aborter)),
             worker: Some(worker),
         })
+    }
+
+    /// Tear down this connection from any thread.
+    ///
+    /// Semantics match `psql`'s Ctrl-C for in-flight queries: the
+    /// underlying TCP socket is shut down both directions, the server
+    /// sees the peer disappear and releases the session, and any
+    /// outstanding `query` / `execute` future returns a
+    /// `ClientError::Connection`.  Subsequent calls on this connection
+    /// also fail, so the caller (typically the REPL) must reconnect to
+    /// keep going.  Idempotent — second and later calls are no-ops.
+    ///
+    /// Important: this does NOT "cancel the query and keep the
+    /// session open".  PWire has no CancelRequest equivalent yet; a
+    /// proper side-channel cancel requires a new server message type
+    /// (tracked separately).  The TCP-shutdown path is the pragmatic
+    /// in-tree approximation — the query stops, but so does the
+    /// session.
+    pub fn abort(&self) {
+        let maybe_sock = {
+            let mut guard = self.aborter.lock();
+            guard.take()
+        };
+        if let Some(sock) = maybe_sock {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
     }
 
     /// Send a command and await its response.  Internally uses a
@@ -326,6 +451,7 @@ fn runtime_worker(
     std_tcp: StdTcpStream,
     cmd_rx: futures::channel::mpsc::UnboundedReceiver<Cmd>,
     ready_tx: std_mpsc::Sender<Result<(), ClientError>>,
+    auth: Option<AuthParams>,
 ) {
     // A SINGLE `block_on` covers the entire worker lifetime so the reactor
     // + pbuf ring + AsyncTcpStream all persist across commands.  Past
@@ -380,7 +506,48 @@ fn runtime_worker(
         let mut recv_buf: VecDeque<u8> = VecDeque::with_capacity(PBUF_SIZE);
         let mut prepared: HashMap<String, u32> = HashMap::new();
 
-        // 3. Barrier — caller is now allowed to send Cmds.
+        // 3a. AUTH handshake.  Only runs when the caller used
+        //     `connect_authed` — existing `connect()` callers get the
+        //     pre-dialect zero-auth behaviour.  We send the frame and
+        //     wait for the server's RESP_OK (or RESP_ERROR) so that a
+        //     rejected handshake surfaces synchronously to the caller
+        //     of `connect_authed` rather than as a mysterious failure
+        //     on the first query.
+        if let Some(auth) = auth.as_ref() {
+            let auth_payload =
+                encode_auth_payload(&auth.user, &auth.password, auth.dialect.as_deref());
+            let auth_result: Result<(), ClientError> = async {
+                send_frame(&stream, VW_REQ_AUTH, &auth_payload).await?;
+                let (ty, payload) = recv_frame(&mut ms, bgid, &mut recv_buf).await?;
+                match ty {
+                    VW_RESP_OK => Ok(()),
+                    VW_RESP_ERROR => {
+                        // Error frame layout: [sqlstate:5][msg_len:u16 LE][msg]
+                        let msg = if payload.len() >= 7 {
+                            let msg_len = u16::from_le_bytes([payload[5], payload[6]]) as usize;
+                            let end = (7 + msg_len).min(payload.len());
+                            String::from_utf8_lossy(&payload[7..end]).into_owned()
+                        } else {
+                            "<truncated>".to_owned()
+                        };
+                        Err(ClientError::Connection(format!("PWire AUTH rejected: {msg}")))
+                    }
+                    other => Err(ClientError::Connection(format!(
+                        "PWire AUTH: unexpected response type 0x{other:02x}"
+                    ))),
+                }
+            }
+            .await;
+            if let Err(e) = auth_result {
+                let _ = ready_tx.send(Err(e));
+                // Let `ms` and `stream` drop in reverse declaration order at
+                // scope end — `ms` borrows from `stream` so we can't move
+                // out of either here.
+                return;
+            }
+        }
+
+        // 3b. Barrier — caller is now allowed to send Cmds.
         let _ = ready_tx.send(Ok(()));
 
         // 4. Dispatch loop.  Uses `futures::select!` to wait on BOTH the

@@ -7,6 +7,7 @@
 //! present it wins over the individual flags.
 
 use clap::{Parser, ValueEnum};
+use clap_complete::Shell;
 
 /// Output format — table (pretty), json (machine-readable), or csv.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -22,6 +23,40 @@ pub enum OutputFormat {
 impl Default for OutputFormat {
     fn default() -> Self {
         Self::Table
+    }
+}
+
+/// SQL dialect selector — the server applies the matching parser mode to
+/// the whole session. Default is `pyro` (native); `pg` / `mysql` let users
+/// migrating from those ecosystems keep their existing SQL dialect while
+/// still using PWire-only features like LiveSync.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Dialect {
+    /// PyroSQL native syntax (accepts PG-compatible SQL too).
+    Pyro,
+    /// Strict PostgreSQL 15 compatibility.
+    Pg,
+    /// MySQL 8 compatibility (backticks, LIMIT x,y, etc.).
+    Mysql,
+}
+
+impl Default for Dialect {
+    fn default() -> Self {
+        Self::Pyro
+    }
+}
+
+impl Dialect {
+    /// Map to the driver's SyntaxMode enum. Keeping the mapping here
+    /// lets the CLI surface friendly short names (`pyro` / `pg` /
+    /// `mysql`) without coupling the rest of the CLI to the driver's
+    /// internal variants.
+    pub fn to_syntax_mode(self) -> pyrosql::SyntaxMode {
+        match self {
+            Self::Pyro => pyrosql::SyntaxMode::PyroSQL,
+            Self::Pg => pyrosql::SyntaxMode::PostgreSQL,
+            Self::Mysql => pyrosql::SyntaxMode::MySQL,
+        }
     }
 }
 
@@ -99,6 +134,13 @@ pub struct Cli {
     #[arg(short = 'f', long, conflicts_with = "command")]
     pub file: Option<String>,
 
+    /// SQL dialect the session uses: `pyro` (default) / `pg` / `mysql`.
+    /// Picks the parser mode the server applies to every statement for
+    /// this connection; orthogonal to the wire protocol (always PWire).
+    /// A URL that already carries `?dialect=…` wins over this flag.
+    #[arg(short = 'D', long, value_enum, default_value_t = Dialect::Pyro)]
+    pub dialect: Dialect,
+
     /// Output format (default: table).
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -118,6 +160,11 @@ pub struct Cli {
     /// Quiet mode — suppress informational banners.
     #[arg(short = 'q', long)]
     pub quiet: bool,
+
+    /// Print a shell completion script to stdout and exit.
+    /// Example:  `pyrosql --completions bash > /etc/bash_completion.d/pyrosql`
+    #[arg(long, value_enum, value_name = "SHELL", hide_default_value = true)]
+    pub completions: Option<Shell>,
 }
 
 #[cfg(test)]
@@ -182,5 +229,31 @@ mod tests {
     fn expanded_short_flag() {
         let cli = Cli::try_parse_from(["pyrosql", "-x"]).unwrap();
         assert!(cli.expanded);
+    }
+
+    #[test]
+    fn dialect_defaults_to_pyro() {
+        let cli = Cli::try_parse_from(["pyrosql"]).unwrap();
+        assert_eq!(cli.dialect, Dialect::Pyro);
+    }
+
+    #[test]
+    fn dialect_short_flag_pg() {
+        let cli = Cli::try_parse_from(["pyrosql", "-D", "pg"]).unwrap();
+        assert_eq!(cli.dialect, Dialect::Pg);
+        assert_eq!(cli.dialect.to_syntax_mode(), pyrosql::SyntaxMode::PostgreSQL);
+    }
+
+    #[test]
+    fn dialect_long_flag_mysql() {
+        let cli = Cli::try_parse_from(["pyrosql", "--dialect", "mysql"]).unwrap();
+        assert_eq!(cli.dialect, Dialect::Mysql);
+        assert_eq!(cli.dialect.to_syntax_mode(), pyrosql::SyntaxMode::MySQL);
+    }
+
+    #[test]
+    fn dialect_rejects_unknown_value() {
+        let res = Cli::try_parse_from(["pyrosql", "--dialect", "oracle"]);
+        assert!(res.is_err());
     }
 }
