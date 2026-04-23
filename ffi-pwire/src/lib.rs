@@ -39,6 +39,8 @@ use std::ptr;
 // ── PWire protocol constants ────────────────────────────────────────────────
 
 const MSG_QUERY: u8 = 0x01;
+const MSG_PREPARE: u8 = 0x02;
+const MSG_BATCH_EXECUTE: u8 = 0x07;
 
 const MSG_AUTH: u8 = 0x06;
 const MSG_COMPRESSED: u8 = 0x10;
@@ -87,16 +89,30 @@ impl PwireConnection {
     /// Negotiate LZ4 compression by sending an AUTH frame with CAP_LZ4.
     fn negotiate_lz4(&mut self) -> Result<(), String> {
         // Send AUTH with empty user/pass but with CAP_LZ4 flag.
+        //
+        // Layout: `[user_len:u8][user][pass_len:u8][pass][dialect_len:u8=0][CAP_LZ4:u8]`
+        //
+        // The `dialect_len=0` byte is mandatory for pyrosql-server
+        // compatibility: its `decode_auth_payload` treats whatever byte
+        // follows `pass` as the dialect length and then expects that
+        // many bytes after it. Without an explicit `dialect_len=0`, the
+        // CAP byte would be interpreted as `dialect_len = CAP_LZ4 = 1`
+        // and the decoder would fail with `Incomplete`, dropping the
+        // connection. Prepending zero bytes of dialect keeps the frame
+        // valid and the CAP byte silently trails past the server's
+        // decoder (server ignores trailing bytes post-dialect today —
+        // if it ever starts using them for caps, we're ready).
         let user = b"";
         let pass = b"";
         self.send_buf.clear();
         self.send_buf.push(MSG_AUTH);
-        let payload_len = 1 + user.len() + 1 + pass.len() + 1;
+        let payload_len = 1 + user.len() + 1 + pass.len() + 1 + 1;
         self.send_buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
         self.send_buf.push(user.len() as u8);
         self.send_buf.extend_from_slice(user);
         self.send_buf.push(pass.len() as u8);
         self.send_buf.extend_from_slice(pass);
+        self.send_buf.push(0u8); // dialect_len=0
         self.send_buf.push(CAP_LZ4);
         self.stream
             .write_all(&self.send_buf)
@@ -339,44 +355,63 @@ impl PwireConnection {
 
                 match tt {
                     TYPE_I64 => {
+                        // PWire wire format for TYPE_I64 is 8 bytes of
+                        // TEXT representation, right-padded with NUL —
+                        // NOT a binary little-endian i64 (the old code
+                        // read this as LE bytes and surfaced garbage
+                        // like `12338` for the text "20"). The server
+                        // builds this via `encode_result_set_into`:
+                        //   `"20"`  →  `[0x32, 0x30, 0, 0, 0, 0, 0, 0]`
+                        //   `"-5"`  →  `[0x2d, 0x35, 0, 0, 0, 0, 0, 0]`
+                        // Strip the trailing zeros, emit the remaining
+                        // ASCII as a raw JSON number (the server never
+                        // pads beyond 8 bytes, so any int up to 8
+                        // digits fits).
                         if pos + 8 > p.len() {
                             buf.extend_from_slice(b"null");
                             continue;
                         }
-                        let v = i64::from_le_bytes([
-                            p[pos],
-                            p[pos + 1],
-                            p[pos + 2],
-                            p[pos + 3],
-                            p[pos + 4],
-                            p[pos + 5],
-                            p[pos + 6],
-                            p[pos + 7],
-                        ]);
+                        let slot = &p[pos..pos + 8];
                         pos += 8;
-                        // Format i64 without pulling in itoa
-                        let s = v.to_string();
-                        buf.extend_from_slice(s.as_bytes());
+                        let end = slot.iter().position(|&b| b == 0).unwrap_or(slot.len());
+                        if end == 0 {
+                            // Empty slot — emit JSON null.
+                            buf.extend_from_slice(b"null");
+                        } else {
+                            // Unpadded text digits — safe to splice
+                            // verbatim into the JSON number slot.
+                            buf.extend_from_slice(&slot[..end]);
+                        }
                     }
                     TYPE_F64 => {
+                        // Same text-padded-to-8 layout as TYPE_I64.
                         if pos + 8 > p.len() {
                             buf.extend_from_slice(b"null");
                             continue;
                         }
-                        let v = f64::from_le_bytes([
-                            p[pos],
-                            p[pos + 1],
-                            p[pos + 2],
-                            p[pos + 3],
-                            p[pos + 4],
-                            p[pos + 5],
-                            p[pos + 6],
-                            p[pos + 7],
-                        ]);
+                        let slot = &p[pos..pos + 8];
                         pos += 8;
-                        // serde_json handles special floats correctly
-                        let s = serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string());
-                        buf.extend_from_slice(s.as_bytes());
+                        let end = slot.iter().position(|&b| b == 0).unwrap_or(slot.len());
+                        if end == 0 {
+                            buf.extend_from_slice(b"null");
+                        } else {
+                            // `serde_json` normalises special floats
+                            // (NaN / Inf → null). Parse the text slice
+                            // first so we don't emit invalid JSON for
+                            // those. If parsing fails, emit the raw
+                            // text anyway — best-effort pass-through.
+                            match std::str::from_utf8(&slot[..end])
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
+                                Some(v) => {
+                                    let s = serde_json::to_string(&v)
+                                        .unwrap_or_else(|_| "null".to_string());
+                                    buf.extend_from_slice(s.as_bytes());
+                                }
+                                None => buf.extend_from_slice(&slot[..end]),
+                            }
+                        }
                     }
                     TYPE_BOOL => {
                         if pos >= p.len() {
@@ -436,6 +471,236 @@ impl PwireConnection {
             }
             RESP_ERROR => -1,
             _ => 0,
+        }
+    }
+
+    /// Send a raw frame with the given opcode + payload. Reuses `send_buf`
+    /// but does NOT invoke LZ4 — the batch opcodes are already efficient
+    /// on their own and the compression negotiation path is tied to
+    /// MSG_QUERY. Pure `write_all` to the TCP stream.
+    fn send_frame(&mut self, msg_type: u8, payload: &[u8]) -> Result<(), String> {
+        self.send_buf.clear();
+        self.send_buf.push(msg_type);
+        self.send_buf
+            .extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        self.send_buf.extend_from_slice(payload);
+        self.stream
+            .write_all(&self.send_buf)
+            .map_err(|e| format!("send: {e}"))
+    }
+
+    /// Read one framed response into `recv_buf[0..]`, storing the type
+    /// byte at `recv_buf[0]` and the payload starting at `recv_buf[1]`.
+    /// Unwraps MSG_COMPRESSED transparently.
+    fn recv_frame(&mut self) -> Result<(), String> {
+        let mut header = [0u8; 5];
+        self.stream
+            .read_exact(&mut header)
+            .map_err(|e| format!("recv header: {e}"))?;
+        let resp_type = header[0];
+        let resp_len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+
+        if resp_type == MSG_COMPRESSED {
+            let mut compressed = vec![0u8; resp_len];
+            if resp_len > 0 {
+                self.stream
+                    .read_exact(&mut compressed)
+                    .map_err(|e| format!("recv compressed payload: {e}"))?;
+            }
+            if compressed.len() < 5 {
+                return Err("compressed payload too short".to_string());
+            }
+            let original_type = compressed[0];
+            let lz4_data = &compressed[5..];
+            let decompressed = lz4_flex::decompress_size_prepended(lz4_data)
+                .map_err(|e| format!("decompress: {e}"))?;
+            self.recv_buf.clear();
+            self.recv_buf.push(original_type);
+            self.recv_buf.extend_from_slice(&decompressed);
+        } else {
+            self.recv_buf.clear();
+            self.recv_buf.push(resp_type);
+            if resp_len > 0 {
+                let prev = self.recv_buf.len();
+                self.recv_buf.resize(prev + resp_len, 0);
+                self.stream
+                    .read_exact(&mut self.recv_buf[prev..prev + resp_len])
+                    .map_err(|e| format!("recv payload: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upper bound on invocations packed into a single wire-level
+    /// `MSG_BATCH_EXECUTE` frame. Bigger batches get chunked and
+    /// stitched internally by `batch_execute_raw`.
+    ///
+    /// 500 is empirically the highest value where the server can
+    /// emit all `RESP_RESULT_SET` replies before the default 30 s
+    /// client recv-timeout fires — above that (measured 10 000 on
+    /// loopback with the `bench` table), the kernel recv buffer
+    /// cycles and our frame-at-a-time read loop stalls long enough
+    /// to trip EAGAIN. Chunking sidesteps the issue transparently;
+    /// caller sees one combined JSON array no matter how big the
+    /// input is.
+    const BATCH_CHUNK_SIZE: usize = 500;
+
+    /// Outer entry point: caller-facing `batch_execute` that accepts
+    /// arbitrary batch sizes and internally chunks + stitches for
+    /// server stability. PREPARE once, then loop BATCH_EXECUTE per
+    /// `BATCH_CHUNK_SIZE` slice, concatenate the per-chunk JSON
+    /// arrays into one final JSON array.
+    ///
+    /// Handle is created once at the start and reused across all
+    /// chunks — the server's prepared cache lives per-session so N
+    /// BATCH_EXECUTEs against the same handle are cheap.
+    ///
+    /// See `BATCH_CHUNK_SIZE` for why we split.
+    fn batch_execute_raw(
+        &mut self,
+        sql: &[u8],
+        param_sets: &[Vec<Vec<u8>>],
+    ) -> Result<String, String> {
+        if param_sets.is_empty() {
+            return Ok("[]".to_string());
+        }
+        let num_params = param_sets[0].len();
+        for (i, ps) in param_sets.iter().enumerate() {
+            if ps.len() != num_params {
+                return Err(format!(
+                    "invocation {i} has {} params, expected {num_params}",
+                    ps.len()
+                ));
+            }
+        }
+
+        // ── 1. PREPARE once, reuse handle for every chunk ────────────────
+        let handle = self.prepare_handle(sql)?;
+
+        // ── 2. Chunked BATCH_EXECUTE ─────────────────────────────────────
+        let mut out = Vec::with_capacity(1024 * param_sets.len());
+        out.push(b'[');
+        let mut first_inv = true;
+        for chunk in param_sets.chunks(Self::BATCH_CHUNK_SIZE) {
+            self.send_batch_execute_frame(handle, chunk, num_params)?;
+            // Read one RESP_RESULT_SET per invocation in this chunk.
+            for _ in 0..chunk.len() {
+                if !first_inv {
+                    out.push(b',');
+                }
+                first_inv = false;
+                self.recv_frame()?;
+                self.append_invocation_json(&mut out);
+            }
+        }
+        out.push(b']');
+        Ok(unsafe { String::from_utf8_unchecked(out) })
+    }
+
+    /// Send MSG_PREPARE, read the response, return the server-issued
+    /// 4-byte handle. Errors if the server returns RESP_ERROR or an
+    /// unexpected response type.
+    fn prepare_handle(&mut self, sql: &[u8]) -> Result<u32, String> {
+        self.send_frame(MSG_PREPARE, sql)?;
+        self.recv_frame()?;
+        if self.recv_buf.is_empty() {
+            return Err("empty PREPARE response".to_string());
+        }
+        let resp_type = self.recv_buf[0];
+        let payload = &self.recv_buf[1..];
+        match resp_type {
+            RESP_OK => {}
+            RESP_ERROR => {
+                let msg = std::str::from_utf8(payload).unwrap_or("<non-utf8>");
+                return Err(format!("PREPARE error: {msg}"));
+            }
+            other => {
+                return Err(format!("PREPARE unexpected resp 0x{other:02x}"));
+            }
+        }
+        if payload.len() < 4 {
+            return Err("PREPARE payload too short for handle".to_string());
+        }
+        Ok(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]))
+    }
+
+    /// Write a single MSG_BATCH_EXECUTE frame to the wire for the
+    /// given handle + slice of param sets. All invocations in the
+    /// slice MUST share the same `num_params`; caller validates.
+    fn send_batch_execute_frame(
+        &mut self,
+        handle: u32,
+        chunk: &[Vec<Vec<u8>>],
+        num_params: usize,
+    ) -> Result<(), String> {
+        let mut payload_size = 4 + 2 + 2; // handle + num_invocations + num_params
+        for ps in chunk {
+            for p in ps {
+                payload_size += 4 + p.len();
+            }
+        }
+        self.send_buf.clear();
+        self.send_buf.push(MSG_BATCH_EXECUTE);
+        self.send_buf
+            .extend_from_slice(&(payload_size as u32).to_le_bytes());
+        self.send_buf.extend_from_slice(&handle.to_le_bytes());
+        self.send_buf
+            .extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+        self.send_buf
+            .extend_from_slice(&(num_params as u16).to_le_bytes());
+        for ps in chunk {
+            for p in ps {
+                self.send_buf
+                    .extend_from_slice(&(p.len() as u32).to_le_bytes());
+                self.send_buf.extend_from_slice(p);
+            }
+        }
+        self.stream
+            .write_all(&self.send_buf)
+            .map_err(|e| format!("BATCH_EXECUTE send: {e}"))
+    }
+
+    /// Append the JSON representation of the current `recv_buf`
+    /// frame (one invocation's response) to `out`. Used by
+    /// `batch_execute_raw` to stitch per-invocation replies into
+    /// one combined JSON array without a second pass.
+    fn append_invocation_json(&self, out: &mut Vec<u8>) {
+        if self.recv_buf.is_empty() {
+            out.extend_from_slice(br#"{"error":"empty response"}"#);
+            return;
+        }
+        let rt = self.recv_buf[0];
+        let payload = &self.recv_buf[1..];
+        match rt {
+            RESP_RESULT_SET => {
+                let one = self.build_json_result_set(payload);
+                out.extend_from_slice(one.as_bytes());
+            }
+            RESP_OK => {
+                let rows_affected = if payload.len() >= 8 {
+                    u64::from_le_bytes([
+                        payload[0], payload[1], payload[2], payload[3], payload[4],
+                        payload[5], payload[6], payload[7],
+                    ])
+                } else {
+                    0
+                };
+                let s = format!(
+                    r#"{{"columns":[],"rows":[],"rows_affected":{rows_affected}}}"#
+                );
+                out.extend_from_slice(s.as_bytes());
+            }
+            RESP_ERROR => {
+                let mut err_obj = Vec::with_capacity(64 + payload.len());
+                err_obj.extend_from_slice(br#"{"error":""#);
+                write_json_escaped(&mut err_obj, payload);
+                err_obj.extend_from_slice(br#""}"#);
+                out.extend_from_slice(&err_obj);
+            }
+            other => {
+                let s = format!(r#"{{"error":"unexpected resp 0x{other:02x}"}}"#);
+                out.extend_from_slice(s.as_bytes());
+            }
         }
     }
 }
@@ -615,6 +880,108 @@ pub extern "C" fn pyro_pwire_execute(
     match handle.query_raw(sql_bytes) {
         Ok(()) => handle.parse_rows_affected(),
         Err(_) => -1,
+    }
+}
+
+/// Pack N `EXECUTE`s of the same SQL template into one
+/// `MSG_BATCH_EXECUTE` (0x07) frame and return the N result sets as
+/// a single JSON array.
+///
+/// The server prepares the SQL once (per call — handles are NOT
+/// cached across calls, keeping the FFI stateless), then dispatches
+/// all N invocations in one wire frame. Responses come back as
+/// `num_invocations` back-to-back `RESP_RESULT_SET` frames; the
+/// output JSON has one element per invocation, in order.
+///
+/// JSON input format (`params_json`):
+/// ```json
+/// [["p1"], ["p2"], ["p3"]]
+/// ```
+/// — an array of arrays of strings. Each inner array is the
+/// parameter set for one invocation; every parameter is passed as
+/// a string. The server decodes string params into the column type
+/// declared by the prepared template (int PK → atoi, text → raw).
+///
+/// JSON output format:
+/// ```json
+/// [{"columns":["v"],"rows":[[42]],"rows_affected":0}, ...]
+/// ```
+/// — one element per input invocation. On per-invocation error:
+/// `{"error":"..."}`. On fatal error (PREPARE failed, invalid
+/// JSON, connection broken): the whole call returns
+/// `{"error":"..."}` (a JSON object, NOT an array) — callers must
+/// peek at the first character.
+///
+/// The caller **must** free the returned pointer with
+/// `pyro_pwire_free_string`. Returns `NULL` only if `conn` is null.
+///
+/// # Safety
+///
+/// - `conn` must be a valid handle from `pyro_pwire_connect`.
+/// - `sql` and `params_json` must be valid null-terminated C strings.
+#[no_mangle]
+pub extern "C" fn pyro_pwire_batch_execute(
+    conn: *mut std::ffi::c_void,
+    sql: *const c_char,
+    params_json: *const c_char,
+) -> *mut c_char {
+    if conn.is_null() {
+        return ptr::null_mut();
+    }
+    if sql.is_null() {
+        return error_json("sql is null");
+    }
+    if params_json.is_null() {
+        return error_json("params_json is null");
+    }
+    let handle = unsafe { &mut *(conn as *mut PwireConnection) };
+    let sql_bytes = unsafe { CStr::from_ptr(sql) }.to_bytes();
+    let params_str = match unsafe { CStr::from_ptr(params_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return error_json("params_json is not valid UTF-8"),
+    };
+
+    // Parse the JSON input shape: array of arrays of strings.
+    let parsed: serde_json::Value = match serde_json::from_str(params_str) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("params_json parse: {e}")),
+    };
+    let outer = match parsed.as_array() {
+        Some(a) => a,
+        None => return error_json("params_json is not a JSON array"),
+    };
+    let mut param_sets: Vec<Vec<Vec<u8>>> = Vec::with_capacity(outer.len());
+    for (i, inv) in outer.iter().enumerate() {
+        let inner = match inv.as_array() {
+            Some(a) => a,
+            None => {
+                return error_json(&format!("invocation {i}: not a JSON array"));
+            }
+        };
+        let mut params: Vec<Vec<u8>> = Vec::with_capacity(inner.len());
+        for (j, p) in inner.iter().enumerate() {
+            match p {
+                serde_json::Value::String(s) => params.push(s.as_bytes().to_vec()),
+                serde_json::Value::Number(n) => params.push(n.to_string().into_bytes()),
+                serde_json::Value::Bool(b) => {
+                    params.push(if *b { b"true".to_vec() } else { b"false".to_vec() });
+                }
+                serde_json::Value::Null => params.push(b"".to_vec()),
+                _ => {
+                    return error_json(&format!(
+                        "invocation {i} param {j}: must be string / number / bool / null"
+                    ));
+                }
+            }
+        }
+        param_sets.push(params);
+    }
+
+    match handle.batch_execute_raw(sql_bytes, &param_sets) {
+        Ok(json) => CString::new(json)
+            .map(|cs| cs.into_raw())
+            .unwrap_or_else(|_| error_json("json contains null byte")),
+        Err(e) => error_json(&e),
     }
 }
 

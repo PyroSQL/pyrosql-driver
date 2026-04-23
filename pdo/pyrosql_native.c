@@ -626,6 +626,94 @@ PHP_FUNCTION(pyrosql_bulk_insert)
     RETURN_LONG(affected);
 }
 
+/* ── pyrosql_batch_execute(conn, sql, params_json): string ──────────
+ *
+ * Packs N EXECUTEs of the same prepared `sql` template into ONE
+ * `MSG_BATCH_EXECUTE` wire frame (opcode 0x07). Returns the server's
+ * N `RESP_RESULT_SET` responses as a single JSON array.
+ *
+ * `params_json` must be a JSON array of arrays of scalars, one inner
+ * array per invocation. Every parameter is passed as a string at the
+ * wire level; the server decodes per the prepared template column
+ * types (`"42"` → `INT 42`, etc.). The FFI also accepts JSON numbers
+ * and booleans as a convenience and stringifies them before the wire
+ * write — callers can skip the manual `"quote everything"` step.
+ *
+ * Return: JSON array string. Example with 2 invocations of
+ * `SELECT v FROM t WHERE id = $1`:
+ *
+ *   [{"columns":["v"],"rows":[[42]],"rows_affected":0},
+ *    {"columns":["v"],"rows":[[84]],"rows_affected":0}]
+ *
+ * On fatal error (PREPARE failed, invalid JSON, broken connection):
+ * throws RuntimeException with the server/transport error message.
+ */
+PHP_FUNCTION(pyrosql_batch_execute)
+{
+    zval *zconn;
+    zend_string *sql;
+    zend_string *params_json;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_OBJECT_OF_CLASS(zconn, pyrosql_connection_ce)
+        Z_PARAM_STR(sql)
+        Z_PARAM_STR(params_json)
+    ZEND_PARSE_PARAMETERS_END();
+
+    pyrosql_conn *conn = get_conn_from_zval(zconn, "pyrosql_batch_execute");
+    if (!conn) RETURN_THROWS();
+
+    if (!fn_batch_execute) {
+        zend_throw_exception(spl_ce_RuntimeException,
+            "pyrosql_batch_execute(): FFI symbol pyro_pwire_batch_execute not "
+            "available — rebuild libpyrosql_ffi_pwire.so (v1.4+) with the "
+            "MSG_BATCH_EXECUTE implementation", 0);
+        RETURN_THROWS();
+    }
+
+    char *result = fn_batch_execute(conn->handle, ZSTR_VAL(sql), ZSTR_VAL(params_json));
+    if (!result) {
+        zend_throw_exception(spl_ce_RuntimeException,
+            "pyrosql_batch_execute: null return from FFI (connection broken?)", 0);
+        RETURN_THROWS();
+    }
+
+    /* Fatal-error detection. The FFI layer returns a JSON OBJECT
+     * ({"error":"..."}) on transport / prepare failure, but a JSON
+     * ARRAY ([...]) on success. Peek at the first non-whitespace
+     * character to decide. */
+    const char *p = result;
+    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+    if (*p == '{') {
+        /* Error object — extract message and throw. */
+        const char *err_start = strstr(result, "\"error\":\"");
+        if (err_start) {
+            err_start += 9;
+            const char *err_end = strchr(err_start, '"');
+            if (err_end) {
+                size_t err_len = err_end - err_start;
+                char *err_msg = emalloc(err_len + 1);
+                memcpy(err_msg, err_start, err_len);
+                err_msg[err_len] = '\0';
+                fn_free_string(result);
+                zend_throw_exception(spl_ce_RuntimeException, err_msg, 0);
+                efree(err_msg);
+                RETURN_THROWS();
+            }
+        }
+        /* Malformed error object — surface the raw JSON. */
+        zend_string *ret = zend_string_init(result, strlen(result), 0);
+        fn_free_string(result);
+        zend_throw_exception(spl_ce_RuntimeException, ZSTR_VAL(ret), 0);
+        zend_string_release(ret);
+        RETURN_THROWS();
+    }
+
+    zend_string *ret = zend_string_init(result, strlen(result), 0);
+    fn_free_string(result);
+    RETURN_STR(ret);
+}
+
 /* ── pyrosql_ping(conn): bool ────────────────────────────────────── */
 PHP_FUNCTION(pyrosql_ping)
 {
@@ -740,6 +828,12 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pyrosql_bulk_insert, 0, 3, IS_LO
     ZEND_ARG_TYPE_INFO(0, json_rows, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pyrosql_batch_execute, 0, 3, IS_STRING, 0)
+    ZEND_ARG_OBJ_INFO(0, conn, PyroSqlConnection, 0)
+    ZEND_ARG_TYPE_INFO(0, sql, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, params_json, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pyrosql_ping, 0, 1, _IS_BOOL, 0)
     ZEND_ARG_OBJ_INFO(0, conn, PyroSqlConnection, 0)
 ZEND_END_ARG_INFO()
@@ -763,6 +857,7 @@ const zend_function_entry pyrosql_native_functions[] = {
     PHP_FE(pyrosql_query_cursor,     arginfo_pyrosql_query_cursor)
     PHP_FE(pyrosql_cursor_next,      arginfo_pyrosql_cursor_next)
     PHP_FE(pyrosql_bulk_insert,      arginfo_pyrosql_bulk_insert)
+    PHP_FE(pyrosql_batch_execute,    arginfo_pyrosql_batch_execute)
     PHP_FE(pyrosql_ping,             arginfo_pyrosql_ping)
     PHP_FE(pyrosql_close,            arginfo_pyrosql_close)
     PHP_FE_END

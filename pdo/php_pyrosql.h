@@ -60,6 +60,7 @@ extern char*   (*fn_query_cursor)(void *h, const char *sql);
 extern char*   (*fn_cursor_next)(void *h, const char *cursor_id);
 extern char*   (*fn_cursor_close)(void *h, const char *cursor_id);
 extern char*   (*fn_bulk_insert)(void *h, const char *table, const char *json_rows);
+extern char*   (*fn_batch_execute)(void *h, const char *sql, const char *params_json);
 
 /* Load shared library (defined in pyrosql_ext.c) */
 extern int pyrosql_load_lib(void);
