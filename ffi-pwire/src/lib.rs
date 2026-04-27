@@ -985,6 +985,144 @@ pub extern "C" fn pyro_pwire_batch_execute(
     }
 }
 
+/// PREPARE the given SQL on the wire, return a JSON object identifying the
+/// server-issued statement handle: `{"handle": <u32>}`. On error returns
+/// `{"error":"..."}`.
+///
+/// Pair with `pyro_pwire_execute_prepared(handle, prepared_json,
+/// params_json)`. The PHP / FFI consumers cache the returned JSON and feed
+/// it back unchanged on subsequent EXECUTE calls.
+///
+/// The caller **must** free the returned pointer with
+/// `pyro_pwire_free_string`. Returns `NULL` only if `conn` is null.
+///
+/// # Safety
+///
+/// - `conn` must be a valid handle from `pyro_pwire_connect`.
+/// - `sql` must be a valid null-terminated C string.
+#[no_mangle]
+pub extern "C" fn pyro_pwire_prepare(
+    conn: *mut std::ffi::c_void,
+    sql: *const c_char,
+) -> *mut c_char {
+    if conn.is_null() {
+        return ptr::null_mut();
+    }
+    if sql.is_null() {
+        return error_json("sql is null");
+    }
+    let handle = unsafe { &mut *(conn as *mut PwireConnection) };
+    let sql_bytes = unsafe { CStr::from_ptr(sql) }.to_bytes();
+    match handle.prepare_handle(sql_bytes) {
+        Ok(h) => {
+            let json = format!(r#"{{"handle":{h}}}"#);
+            CString::new(json)
+                .map(|cs| cs.into_raw())
+                .unwrap_or_else(|_| error_json("prepared json contains null byte"))
+        }
+        Err(e) => error_json(&e),
+    }
+}
+
+/// Execute a prepared statement once with one set of parameters. The
+/// `prepared_json` argument is whatever `pyro_pwire_prepare` returned (it
+/// must contain `"handle":<u32>`). The `params_json` is a JSON array of
+/// values: `["42", "alice", null]`. String / Number / Bool / Null are all
+/// supported; Number / Bool / Null are stringified before being sent on
+/// the wire (the server treats every BATCH_EXECUTE param as a text slot
+/// and decodes per the prepared template's column type).
+///
+/// Returns one of:
+/// - `{"columns":[...],"rows":[...],"rows_affected":0}` on success
+/// - `{"columns":[],"rows":[],"rows_affected":N}` on INSERT/UPDATE/DELETE
+/// - `{"error":"..."}` on failure (per-invocation or fatal)
+///
+/// The caller **must** free the returned pointer with
+/// `pyro_pwire_free_string`. Returns `NULL` only if `conn` is null.
+///
+/// # Safety
+///
+/// - `conn` must be a valid handle from `pyro_pwire_connect`.
+/// - `prepared_json` and `params_json` must be valid null-terminated C
+///   strings.
+#[no_mangle]
+pub extern "C" fn pyro_pwire_execute_prepared(
+    conn: *mut std::ffi::c_void,
+    prepared_json: *const c_char,
+    params_json: *const c_char,
+) -> *mut c_char {
+    if conn.is_null() {
+        return ptr::null_mut();
+    }
+    if prepared_json.is_null() {
+        return error_json("prepared_json is null");
+    }
+    if params_json.is_null() {
+        return error_json("params_json is null");
+    }
+    let handle = unsafe { &mut *(conn as *mut PwireConnection) };
+
+    let prepared_str = match unsafe { CStr::from_ptr(prepared_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return error_json("prepared_json is not valid UTF-8"),
+    };
+    let params_str = match unsafe { CStr::from_ptr(params_json) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return error_json("params_json is not valid UTF-8"),
+    };
+
+    let prepared: serde_json::Value = match serde_json::from_str(prepared_str) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("prepared parse: {e}")),
+    };
+    let stmt_handle: u32 = match prepared.get("handle").and_then(|h| h.as_u64()) {
+        Some(h) => h as u32,
+        None => return error_json("prepared_json missing 'handle' field"),
+    };
+
+    let params: serde_json::Value = match serde_json::from_str(params_str) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("params parse: {e}")),
+    };
+    let inner = match params.as_array() {
+        Some(a) => a,
+        None => return error_json("params_json is not a JSON array"),
+    };
+    let mut byte_params: Vec<Vec<u8>> = Vec::with_capacity(inner.len());
+    for (j, p) in inner.iter().enumerate() {
+        match p {
+            serde_json::Value::String(s) => byte_params.push(s.as_bytes().to_vec()),
+            serde_json::Value::Number(n) => byte_params.push(n.to_string().into_bytes()),
+            serde_json::Value::Bool(b) => {
+                byte_params.push(if *b { b"true".to_vec() } else { b"false".to_vec() });
+            }
+            serde_json::Value::Null => byte_params.push(b"".to_vec()),
+            _ => {
+                return error_json(&format!(
+                    "param {j}: must be string / number / bool / null"
+                ));
+            }
+        }
+    }
+
+    // Single-invocation BATCH_EXECUTE: reuses the same wire path the
+    // bulk batch_execute() uses, just with chunk.len()==1.
+    let chunk: [Vec<Vec<u8>>; 1] = [byte_params];
+    let num_params = chunk[0].len();
+    if let Err(e) = handle.send_batch_execute_frame(stmt_handle, &chunk, num_params) {
+        return error_json(&e);
+    }
+    if let Err(e) = handle.recv_frame() {
+        return error_json(&e);
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    handle.append_invocation_json(&mut out);
+    let json = unsafe { String::from_utf8_unchecked(out) };
+    CString::new(json)
+        .map(|cs| cs.into_raw())
+        .unwrap_or_else(|_| error_json("execute_prepared json contains null byte"))
+}
+
 /// Free a JSON string returned by `pyro_pwire_query`.
 ///
 /// Safe to call with `NULL`.
@@ -1069,6 +1207,7 @@ mod tests {
                 RESP_OK,
                 5, 0, 0, 0, 0, 0, 0, 0, // rows_affected = 5
             ],
+            supports_lz4: false,
         };
         let json = conn.build_json();
         assert_eq!(json, r#"{"columns":[],"rows":[],"rows_affected":5}"#);
@@ -1082,6 +1221,7 @@ mod tests {
             stream: unsafe { std::mem::zeroed() },
             send_buf: Vec::new(),
             recv_buf,
+            supports_lz4: false,
         };
         let json = conn.build_json();
         assert_eq!(json, r#"{"error":"table not found"}"#);
@@ -1109,6 +1249,7 @@ mod tests {
             stream: unsafe { std::mem::zeroed() },
             send_buf: Vec::new(),
             recv_buf,
+            supports_lz4: false,
         };
         let json = conn.build_json();
         assert_eq!(
@@ -1123,6 +1264,7 @@ mod tests {
             stream: unsafe { std::mem::zeroed() },
             send_buf: Vec::new(),
             recv_buf: vec![RESP_OK, 42, 0, 0, 0, 0, 0, 0, 0],
+            supports_lz4: false,
         };
         assert_eq!(conn.parse_rows_affected(), 42);
     }
@@ -1133,6 +1275,7 @@ mod tests {
             stream: unsafe { std::mem::zeroed() },
             send_buf: Vec::new(),
             recv_buf: vec![RESP_ERROR, b'e'],
+            supports_lz4: false,
         };
         assert_eq!(conn.parse_rows_affected(), -1);
     }
